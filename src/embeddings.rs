@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 /// Local, no-API sentence embeddings — all-MiniLM-L6-v2 via ONNX Runtime
 /// (the same model mindforge's own `tools/dedupe_semantic.py` already
 /// uses through Python's fastembed). The model downloads once from
-/// Hugging Face on first use and is cached at `~/.memoryforge/models/`
+/// Hugging Face on first use and is cached at `~/.trm/models/`
 /// after that — no per-call network access, no LLM API, no per-token
 /// cost. Consistent with ADR-0002's "no external APIs" for judgment
 /// work: this is a fixed, deterministic embedding model, not an LLM
@@ -173,7 +173,7 @@ mod tests {
     // This test is slow (real download on a fresh cache dir) and must
     // run alone, not interleaved with other tests hitting the same
     // shared cache — see the module doc on why cache_dir is now an
-    // explicit parameter instead of the global ~/.memoryforge/models.
+    // explicit parameter instead of the global ~/.trm/models.
     #[test]
     fn concurrent_first_time_downloads_do_not_corrupt_each_other() {
         let cache_dir = tempfile::tempdir().unwrap();

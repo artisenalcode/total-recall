@@ -19,13 +19,13 @@ pub struct BankPaths {
 }
 
 /// The data root for all banks. `MF_DATA_ROOT` overrides for tests /
-/// alternate installs; defaults to `~/.memoryforge` per ADR-0001.
+/// alternate installs; defaults to `~/.trm` per ADR-0001.
 pub fn data_root() -> PathBuf {
     if let Ok(over) = std::env::var("MF_DATA_ROOT") {
         return PathBuf::from(over);
     }
-    let home = std::env::var("HOME").expect("HOME must be set to locate ~/.memoryforge");
-    PathBuf::from(home).join(".memoryforge")
+    let home = std::env::var("HOME").expect("HOME must be set to locate ~/.trm");
+    PathBuf::from(home).join(".trm")
 }
 
 pub fn paths_for(data_root: &Path, bank_id: &str) -> BankPaths {

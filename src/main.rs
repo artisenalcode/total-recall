@@ -154,7 +154,7 @@ for audit, it isn't deleted.
     trm curator-scan [--threshold 0.8]
 
 Local sentence-embedding cosine similarity (all-MiniLM-L6-v2 via ONNX,
-downloaded once and cached at `~/.memoryforge/models/`, no external API —
+downloaded once and cached at `~/.trm/models/`, no external API —
 the same model mindforge's own `tools/dedupe_semantic.py` already uses
 through Python's fastembed, this is the Rust-native equivalent) between
 every pair of wiki entries — a candidate finder, not a judgment. Stages a
@@ -181,7 +181,7 @@ model already available in this project's own toolchain.
 
 ## Where facts live
 
-~/.memoryforge/banks/<bank-id>/wiki/<slug>.md — one file per fact, plain
+~/.trm/banks/<bank-id>/wiki/<slug>.md — one file per fact, plain
 markdown, human-readable. index.md in the same bank directory lists every
 entry with a one-line summary, plus a Pending section for anything staged
 but not yet processed (empty until ingestion pathways exist).
@@ -593,7 +593,7 @@ mod tests {
     fn core_docs_covers_retain_and_bank_resolution() {
         assert!(CORE_DOCS.contains("trm retain"));
         assert!(CORE_DOCS.contains("--bank"));
-        assert!(CORE_DOCS.contains(".memoryforge"));
+        assert!(CORE_DOCS.contains(".trm"));
     }
 
     #[test]
