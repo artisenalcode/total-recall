@@ -92,6 +92,12 @@ pub struct RankedMatch {
     pub window_offset: usize,
 }
 
+/// (offset, end_offset, vector) for one resolved window, and the
+/// per-slug list of them — factored out purely to satisfy
+/// `clippy::type_complexity`, no behavioral meaning beyond that.
+type ResolvedWindow = (usize, usize, Vec<f32>);
+type ResolvedWindows = Vec<Option<Vec<ResolvedWindow>>>;
+
 /// Semantic recall: rank every entry in `wiki_dir` by cosine similarity
 /// to `query` (local embeddings — same model/mechanism curator-scan
 /// already uses, reused rather than rebuilt). Replaces an earlier
@@ -111,52 +117,119 @@ pub fn semantic_search(
         return Ok(Vec::new());
     }
 
-    // Window every candidate file (a short file — the common case —
-    // produces exactly one window, so this is a no-op cost-wise for
-    // anything that was already fine). Every window across every file,
-    // plus the query, is embedded in one batched call.
+    // Per-slug resolved windows: (offset, end_offset, vector), either
+    // reused from a still-valid cache entry or freshly embedded below.
+    // `None` placeholders get filled in once the batch embed call
+    // returns; keeping content alongside so a cache miss's window text
+    // can be sliced out for `snippet_of` without re-reading the file.
+    let mut contents: Vec<String> = Vec::with_capacity(slugs.len());
+    let mut resolved: ResolvedWindows = Vec::with_capacity(slugs.len());
+
+    // Batch-embed only what's actually dirty (missing or stale cache) —
+    // the whole point of this cache: an unchanged bank costs one query
+    // embed and zero file re-embeds, not a full re-embed every call.
     let mut texts = vec![query.to_string()];
-    let mut owner_slug_idx = Vec::new();
-    let mut owner_offset = Vec::new();
+    let mut dirty_slug_idx = Vec::new();
+    let mut dirty_window_span = Vec::new(); // (offset, end_offset) per queued text
+
     for (slug_idx, slug) in slugs.iter().enumerate() {
         let content = read(wiki_dir, slug).map_err(|e| e.to_string())?;
-        for (offset, window_text) in crate::window::windows(
-            &content,
-            crate::window::WINDOW_WORDS,
-            crate::window::OVERLAP_WORDS,
-        ) {
-            texts.push(window_text);
-            owner_slug_idx.push(slug_idx);
-            owner_offset.push(offset);
+        let hash = crate::embed_cache::content_hash(&content);
+
+        match crate::embed_cache::load(wiki_dir, slug) {
+            Some(cache) if cache.content_hash == hash => {
+                resolved.push(Some(
+                    cache
+                        .windows
+                        .into_iter()
+                        .map(|w| (w.offset, w.end_offset, w.vector))
+                        .collect(),
+                ));
+            }
+            _ => {
+                resolved.push(None); // filled in after the batch embed below
+                for (offset, window_text) in crate::window::windows(
+                    &content,
+                    crate::window::WINDOW_WORDS,
+                    crate::window::OVERLAP_WORDS,
+                ) {
+                    let end_offset = offset + window_text.len();
+                    texts.push(window_text);
+                    dirty_slug_idx.push(slug_idx);
+                    dirty_window_span.push((offset, end_offset));
+                }
+            }
         }
+        contents.push(content);
     }
 
-    let vectors = embedder.embed(&texts)?;
-    let query_vec = &vectors[0];
-
-    // Max score per source file — a file matches as well as its
-    // best-matching window, and that window's text/offset become the
-    // reported snippet/window_offset so a caller can tell *why* it
-    // matched, not just that it did.
-    let mut best: Vec<Option<(f32, usize, usize)>> = vec![None; slugs.len()];
-    for (window_i, (&slug_idx, &offset)) in owner_slug_idx.iter().zip(&owner_offset).enumerate() {
-        let score = crate::embeddings::cosine_similarity(query_vec, &vectors[window_i + 1]);
-        let current = &mut best[slug_idx];
-        if current.is_none_or(|(best_score, _, _)| score > best_score) {
-            *current = Some((score, offset, window_i));
+    if !dirty_slug_idx.is_empty() {
+        let vectors = embedder.embed(&texts)?;
+        // vectors[0] is the query; dirty windows start at vectors[1].
+        let mut per_slug: Vec<Vec<(usize, usize, Vec<f32>)>> = vec![Vec::new(); slugs.len()];
+        for (i, &slug_idx) in dirty_slug_idx.iter().enumerate() {
+            let (offset, end_offset) = dirty_window_span[i];
+            per_slug[slug_idx].push((offset, end_offset, vectors[i + 1].clone()));
         }
+        for &slug_idx in &dirty_slug_idx {
+            if resolved[slug_idx].is_none() {
+                let windows = std::mem::take(&mut per_slug[slug_idx]);
+                let cache = crate::embed_cache::EntryCache {
+                    content_hash: crate::embed_cache::content_hash(&contents[slug_idx]),
+                    windows: windows
+                        .iter()
+                        .map(
+                            |(offset, end_offset, vector)| crate::embed_cache::CachedWindow {
+                                offset: *offset,
+                                end_offset: *end_offset,
+                                vector: vector.clone(),
+                            },
+                        )
+                        .collect(),
+                };
+                let _ = crate::embed_cache::save(wiki_dir, &slugs[slug_idx], &cache);
+                resolved[slug_idx] = Some(windows);
+            }
+        }
+
+        // The query itself only needs embedding when something was
+        // actually dirty — an unchanged bank never calls `embed` at all.
+        let query_vec = vectors[0].clone();
+        return rank(slugs, contents, resolved, &query_vec, min_score, limit);
     }
 
+    // Fully cached: still need the query embedded to score against it.
+    let query_vec = embedder.embed(&[query.to_string()])?.remove(0);
+    rank(slugs, contents, resolved, &query_vec, min_score, limit)
+}
+
+fn rank(
+    slugs: Vec<String>,
+    contents: Vec<String>,
+    resolved: ResolvedWindows,
+    query_vec: &[f32],
+    min_score: f32,
+    limit: usize,
+) -> Result<Vec<RankedMatch>, String> {
     let mut matches: Vec<RankedMatch> = slugs
         .into_iter()
-        .zip(best)
-        .filter_map(|(slug, hit)| {
-            hit.map(|(score, offset, window_i)| RankedMatch {
-                slug,
-                score,
-                snippet: snippet_of(&texts[window_i + 1]),
-                window_offset: offset,
-            })
+        .zip(contents)
+        .zip(resolved)
+        .filter_map(|((slug, content), windows)| {
+            let windows = windows?;
+            windows
+                .iter()
+                .map(|(offset, end_offset, vector)| {
+                    let score = crate::embeddings::cosine_similarity(query_vec, vector);
+                    (score, *offset, *end_offset)
+                })
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(score, offset, end_offset)| RankedMatch {
+                    slug,
+                    score,
+                    snippet: snippet_of(content[offset..end_offset].trim_end()),
+                    window_offset: offset,
+                })
         })
         .filter(|m| m.score >= min_score)
         .collect();
@@ -289,6 +362,73 @@ mod tests {
         assert!(
             matches.is_empty(),
             "unrelated content shouldn't clear a near-1.0 floor"
+        );
+    }
+
+    #[test]
+    fn semantic_search_persists_an_embedding_cache_file_after_first_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_named(tmp.path(), "fact", "podman containers, not docker").unwrap();
+
+        let mut e = embedder();
+        semantic_search(tmp.path(), "containers", &mut e, 0.0, 10).unwrap();
+
+        assert!(
+            crate::embed_cache::load(tmp.path(), "fact").is_some(),
+            "a cache file should exist for the entry after a real recall call"
+        );
+    }
+
+    #[test]
+    fn semantic_search_does_not_recompute_an_unchanged_entrys_cache_on_a_second_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_named(tmp.path(), "fact", "podman containers, not docker").unwrap();
+
+        let mut e = embedder();
+        semantic_search(tmp.path(), "containers", &mut e, 0.0, 10).unwrap();
+        let cache_path = tmp.path().join(".embeddings/fact.cache");
+        let mtime_after_first = fs::metadata(&cache_path).unwrap().modified().unwrap();
+
+        // A second call against unchanged content must not rewrite the
+        // cache file — proof the entry wasn't re-embedded, not just that
+        // results still look right.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        semantic_search(tmp.path(), "different query entirely", &mut e, 0.0, 10).unwrap();
+        let mtime_after_second = fs::metadata(&cache_path).unwrap().modified().unwrap();
+
+        assert_eq!(
+            mtime_after_first, mtime_after_second,
+            "cache file should not be rewritten when the entry's content hasn't changed"
+        );
+    }
+
+    #[test]
+    fn semantic_search_invalidates_the_cache_when_content_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_named(tmp.path(), "fact", "the weather today is sunny and warm").unwrap();
+
+        let mut e = embedder();
+        semantic_search(tmp.path(), "containers", &mut e, 0.0, 10).unwrap();
+        let cache = crate::embed_cache::load(tmp.path(), "fact").unwrap();
+        let old_hash = cache.content_hash;
+
+        // Overwrite the same slug with unrelated new content.
+        write_named(
+            tmp.path(),
+            "fact",
+            "podman containers require explicit networking",
+        )
+        .unwrap();
+        let matches = semantic_search(tmp.path(), "podman networking", &mut e, 0.3, 10).unwrap();
+
+        let refreshed = crate::embed_cache::load(tmp.path(), "fact").unwrap();
+        assert_ne!(
+            refreshed.content_hash, old_hash,
+            "cache should reflect the new content's hash, not the stale one"
+        );
+        assert!(
+            matches.iter().any(|m| m.slug == "fact"),
+            "recall should find the updated content, not stale cached vectors"
         );
     }
 
