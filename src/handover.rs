@@ -1,7 +1,14 @@
-use crate::{atomic, bank, wiki};
+use crate::{atomic, bank, concepts, embeddings, wiki};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+
+/// Below this, `stage()` doesn't bother pre-splitting into candidate
+/// concepts — matches squishi's own "skip compression under N chars"
+/// pattern (same number, same reasoning: nothing meaningful to gain on
+/// content this small).
+const CONCEPT_SPLIT_MIN_CHARS: usize = 2000;
+const CONCEPT_SPLIT_THRESHOLD: f32 = 0.8;
 
 /// The kind of judgment call being handed back to the calling harness.
 /// Per ADR-0002: trm never calls an LLM itself; it only describes what
@@ -31,6 +38,24 @@ pub struct HandoverTask {
     /// part of a handover must be able to tell trusted from untrusted input,
     /// the same way a prompt should never blur data and instructions.
     pub source: String,
+    /// Deterministic concept-split candidates (empty for small content, or
+    /// when splitting wasn't available — see `stage()`). Per ADR-0004: lets
+    /// the judging sub-agent work through indexed candidates instead of one
+    /// undifferentiated blob — each real one gets `retain`ed on its own,
+    /// this handover just needs `complete-handover` to close the audit
+    /// trail once judgment is done.
+    pub candidate_concepts: Vec<String>,
+    /// Set when concept-splitting was attempted (content was large enough)
+    /// but failed (model unavailable, offline, corrupted cache) — distinct
+    /// from `candidate_concepts` simply being empty because content was
+    /// small. Found in review (2026-08-07): the original fallback was
+    /// silent, indistinguishable from "nothing to split," which let a
+    /// sub-agent unknowingly `complete-handover` a whole raw blob as one
+    /// result and reproduce the exact bug this mechanism exists to
+    /// prevent. Rendered as an explicit note in `as_prompt()` so the
+    /// sub-agent knows it's judging an unsplit blob on purpose, not by
+    /// silent degradation.
+    pub split_failure: Option<String>,
 }
 
 impl HandoverTask {
@@ -45,7 +70,25 @@ impl HandoverTask {
             description: description.into(),
             sources,
             source: source.into(),
+            candidate_concepts: Vec::new(),
+            split_failure: None,
         }
+    }
+
+    /// Attach pre-split candidate concepts — a separate builder step
+    /// rather than a `new()` parameter, so every existing call site
+    /// (curator, tests) that doesn't need this is untouched.
+    pub fn with_candidate_concepts(mut self, candidates: Vec<String>) -> Self {
+        self.candidate_concepts = candidates;
+        self
+    }
+
+    /// Record that concept-splitting was attempted and failed — see
+    /// `split_failure`'s doc comment for why this is distinct from
+    /// simply not calling `with_candidate_concepts` at all.
+    pub fn with_split_failure(mut self, reason: impl Into<String>) -> Self {
+        self.split_failure = Some(reason.into());
+        self
     }
 
     fn is_trusted(&self) -> bool {
@@ -65,8 +108,36 @@ impl HandoverTask {
                 self.source
             )
         };
+        let split_note = match &self.split_failure {
+            Some(reason) => format!(
+                "\n\nNOTE: this content was large enough to attempt concept pre-split, but \
+                 splitting failed ({reason}) — you're judging the raw, unsplit blob below on \
+                 purpose, not because there was nothing to split. Extract what's genuinely \
+                 durable from it as you normally would."
+            ),
+            None => String::new(),
+        };
+        let candidates = if self.candidate_concepts.is_empty() {
+            String::new()
+        } else {
+            let listed = self
+                .candidate_concepts
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{}. {c}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n\n{} candidate concept(s), pre-split deterministically (not judged):\n{listed}\n\n\
+                 For each real, worth-keeping concept: `trm retain \"<concept>\"` on its own \
+                 (it's now a single judged fact — no further handover needed for it). Discard \
+                 candidates that aren't genuinely worth persisting. When done, `trm complete-handover \
+                 <job-id> \"<N kept, M discarded>\"` to close this handover out.",
+                self.candidate_concepts.len()
+            )
+        };
         format!(
-            "{:?} handover: {}\nsource: {}\nsources:\n{}{warning}",
+            "{:?} handover: {}\nsource: {}\nsources:\n{}{warning}{split_note}{candidates}",
             self.kind,
             self.description,
             self.source,
@@ -84,6 +155,17 @@ impl HandoverTask {
 /// future harness session can find it. `source` labels provenance —
 /// "direct" for user/agent-authored content, anything else (e.g.
 /// "web-scrape") is treated as untrusted and flagged in the prompt.
+///
+/// Per ADR-0004: content over `CONCEPT_SPLIT_MIN_CHARS` gets deterministically
+/// pre-split into candidate concepts (`concepts::split`) before the prompt is
+/// rendered, so the judging sub-agent works through indexed candidates
+/// instead of one undifferentiated blob. Splitting is best-effort — if the
+/// embedding model isn't available (offline, first-run download failed),
+/// `stage` falls back to today's whole-content behavior rather than failing
+/// the stage outright; same resilience posture as squishi's
+/// `semantic_dedup` falling back to line-dedup when its model is
+/// unavailable.
+///
 /// Returns the job id (== slug).
 pub fn stage(
     paths: &bank::BankPaths,
@@ -95,9 +177,34 @@ pub fn stage(
     let raw_path = paths.raw.join(format!("{slug}.md"));
     atomic::write(&raw_path, content)?;
 
-    let task = HandoverTask::new(HandoverKind::Extraction, reason, vec![raw_path], source);
+    let mut task = HandoverTask::new(HandoverKind::Extraction, reason, vec![raw_path], source);
+    if content.len() > CONCEPT_SPLIT_MIN_CHARS {
+        task = match split_into_candidates(content) {
+            Ok(candidates) => task.with_candidate_concepts(candidates),
+            // Attempted and failed — recorded, not swallowed (review
+            // finding 2026-08-07: a silent fallback here was
+            // indistinguishable from "nothing to split," letting a
+            // sub-agent unknowingly complete-handover a whole raw blob
+            // and reproduce the exact bug this mechanism prevents).
+            Err(e) => task.with_split_failure(e),
+        };
+    }
     atomic::write(&paths.pending.join(format!("{slug}.md")), &task.as_prompt())?;
     Ok(slug)
+}
+
+/// Isolated so a model-load/split failure is a plain `Err(reason)` the
+/// caller records on the task, rather than silently swallowed — same
+/// resilience *intent* as squishi's semantic-dedup fallback, but visible
+/// this time (see `HandoverTask::split_failure`'s doc comment for why
+/// squishi's own silent-fallback-to-a-simpler-pass shape doesn't fully
+/// apply here: there, the fallback result is still real, useful,
+/// judged-nothing output; here, "fall back to the raw blob" is exactly
+/// the shape of the original bug if nobody's told it happened).
+fn split_into_candidates(content: &str) -> Result<Vec<String>, String> {
+    let mut embedder = embeddings::Embedder::new(bank::data_root().join("models"))
+        .map_err(|e| format!("embedding model unavailable: {e}"))?;
+    concepts::split(content, &mut embedder, CONCEPT_SPLIT_THRESHOLD)
 }
 
 /// List open handover job ids in a bank (empty if none, or the bank has
@@ -188,6 +295,25 @@ mod tests {
         assert!(prompt.contains("raw/b.md"));
     }
 
+    /// Review finding fix (2026-08-07): a split failure must render as an
+    /// explicit, visible note distinct from "nothing to split" — this is
+    /// the rendering-logic test; the actual model-load failure path
+    /// (`split_into_candidates`) isn't cheaply forceable in a fast unit
+    /// test, so this exercises the deterministic contract directly via
+    /// `with_split_failure` rather than needing a real broken model cache.
+    #[test]
+    fn as_prompt_notes_a_split_failure_distinctly_from_no_candidates() {
+        let with_failure = HandoverTask::new(HandoverKind::Extraction, "reason", vec![], "direct")
+            .with_split_failure("embedding model unavailable: offline");
+        let without_failure =
+            HandoverTask::new(HandoverKind::Extraction, "reason", vec![], "direct");
+
+        let failure_prompt = with_failure.as_prompt();
+        assert!(failure_prompt.contains("splitting failed"));
+        assert!(failure_prompt.contains("embedding model unavailable: offline"));
+        assert!(!without_failure.as_prompt().contains("splitting failed"));
+    }
+
     #[test]
     fn direct_source_gets_no_untrusted_warning() {
         let task = HandoverTask::new(HandoverKind::Extraction, "a fact", vec![], "direct");
@@ -242,6 +368,47 @@ mod tests {
         );
         let marker = fs::read_to_string(paths.pending.join(format!("{job_id}.md"))).unwrap();
         assert!(marker.contains("extract facts from this"));
+    }
+
+    /// Per ADR-0004: bulk/multi-concept content staged for a handover
+    /// should get pre-split into indexed candidate concepts, so the
+    /// judging sub-agent isn't handed one undifferentiated blob. Small
+    /// content (below the concepts::split threshold) is unaffected —
+    /// this test proves the large-content path specifically.
+    #[test]
+    fn stage_with_large_multi_concept_content_lists_indexed_candidates() {
+        let (_data_root, paths) = test_paths();
+        let filler =
+            "unrelated filler content about gardening tips and weather patterns. ".repeat(80);
+        let content = format!(
+            "{filler}New hires must get their manager's signoff on the onboarding \
+             checklist by their third day. The deployment pipeline runs a full \
+             integration test suite before every production release."
+        );
+
+        let job_id = stage(
+            &paths,
+            &content,
+            "extract durable facts from this",
+            "direct",
+        )
+        .unwrap();
+        let marker = fs::read_to_string(paths.pending.join(format!("{job_id}.md"))).unwrap();
+
+        assert!(
+            marker.contains("candidate concept"),
+            "large content's pending marker should list indexed candidates, got:\n{marker}"
+        );
+        assert!(marker.contains("manager's signoff"));
+        assert!(marker.contains("integration test suite"));
+    }
+
+    #[test]
+    fn stage_with_small_content_has_no_candidate_concepts_section() {
+        let (_data_root, paths) = test_paths();
+        let job_id = stage(&paths, "a short raw note", "extract facts", "direct").unwrap();
+        let marker = fs::read_to_string(paths.pending.join(format!("{job_id}.md"))).unwrap();
+        assert!(!marker.contains("candidate concept"));
     }
 
     #[test]

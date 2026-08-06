@@ -1,10 +1,12 @@
 mod atomic;
 mod bank;
+mod concepts;
 mod curator;
 mod embeddings;
 mod handover;
 mod lock;
 mod wiki;
+mod window;
 
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -110,16 +112,18 @@ replaced an earlier grep-based version entirely. Prints `<score>  <slug>:
 <snippet>` for the top 5 matches scoring >= 0.3 cosine similarity, or "no
 matches" if none. Same bank-resolution rules as retain.
 
-Known limitation (found empirically): the embedding model truncates each
-document to ~256 tokens before embedding, same caveat as curator-scan.
-A real miss found during calibration — `trm recall "how do promotions
-work at a big company"` failed to surface `ethan-evans` (whose entire
-content is about promotions) because his wiki file leads with frontmatter
-and biography; the actual framework content likely falls past the
-truncation point. Entries that front-load their most-distinctive content
-will recall better than ones that lead with preamble. Not fixed here —
-would need chunked embedding (multiple windows per doc, max score wins)
-to fully resolve; documented rather than silently threshold-tuned around.
+Windowed since 2026-08-07 (ADR-0004): a long entry is split into
+overlapping ~80-word windows before embedding, scored per window, best
+score wins — a whole-file-as-one-vector approach used to hard-truncate
+anything past ~211-261 words (found empirically; the original documented
+miss was `ethan-evans`, whose real content sat past that point). Windowing
+fixes recall against already-stored large entries; it doesn't fully solve
+same-topic dilution within a window on its own (measured: a real point
+diluted by ~150 words of a single unrelated topic still scores only
+~0.28-0.30 regardless of window size) — `stage`'s concept pre-split below
+is the write-time complement, keeping newly-staged entries small and
+mostly-single-topic in the first place rather than relying on windowing
+alone to recover from a large blob.
 
 ## Handover (extraction/curation trm can't do itself — see ADR-0002)
 
@@ -139,13 +143,29 @@ its bank the same way — code archaeology resolves from the target repo
 path, not the invoking directory). `pending-show <job-id>` prints a job's
 exact rendered prompt — feed this verbatim to a sub-agent.
 
+**Content over ~2000 chars gets concept-pre-split automatically**
+(ADR-0004, 2026-08-07): `stage` deterministically splits large/ambiguous
+content into candidate concepts (sentence-level, near-duplicate-collapsed
+— same algorithm `advisory/tools/dedupe_semantic.py` proved out) *before*
+rendering the prompt. **If you're the sub-agent handling a handover whose
+prompt lists numbered candidate concepts: judge each one, `trm retain
+"<concept>"` individually for every one genuinely worth keeping — it's
+now a single judged fact, no further handover needed for it — discard the
+rest, then `trm complete-handover <job-id> "<N kept, M discarded>"` to
+close the audit trail.** Do not `complete-handover` the whole raw blob as
+a single result for split content — that reproduces the exact bug this
+mechanism exists to prevent (one giant, barely-recallable entry). Small
+content (no listed candidates in the prompt) is unaffected — handle it as
+a normal single-result extraction.
+
 **The shared handover-completion workflow** (one place, not reimplemented
 per ingestion pathway): run `trm pending --all`; for each `<bank>/<job-id>`,
 run `trm pending-show <job-id> -p <bank>` and spawn a sub-agent with that
-exact content as its prompt; take the sub-agent's final output and run
-`trm complete-handover <job-id> "<result>" -p <bank>`. trm never calls an
-LLM itself — the calling harness is responsible for the judgment work.
-`complete-handover` writes the result into the wiki tier,
+exact content as its prompt; the sub-agent follows the candidate-concept
+pattern above if the prompt has one, otherwise does its own extraction and
+calls `trm complete-handover <job-id> "<result>" -p <bank>` directly. trm
+never calls an LLM itself — the calling harness is responsible for the
+judgment work. `complete-handover` writes its result into the wiki tier,
 updates index.md, and clears the pending marker; the raw source stays
 for audit, it isn't deleted.
 
@@ -188,9 +208,13 @@ but not yet processed (empty until ingestion pathways exist).
 
 ## What trm does not do (yet)
 
-No ingestion pathways (repo scan, YouTube, web scrape), no curation/pruning
-pass, no semantic search. Direct retain and grep-based recall are the only
-read/write paths in this version.
+No ingestion pathways for repo scan, YouTube, or web scrape (`code
+archaeology`/`youtube`/`web-scrape` per CONTEXT.md's resolved-but-unbuilt
+pathway list). `docs/chat-exports/`-style bulk sources have the mechanism
+(stage + concept pre-split) but no dedicated ingestion script wired to it
+yet. Kimi Code session ingestion is explicitly deferred (Claude Code
+proven first, per the user's own sequencing call) — real Kimi session data
+exists on disk, nothing reads it into trm yet.
 "#;
 
 fn main() -> ExitCode {
