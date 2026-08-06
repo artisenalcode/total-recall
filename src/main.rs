@@ -2,6 +2,7 @@ mod atomic;
 mod bank;
 mod concepts;
 mod curator;
+mod doctor;
 mod embeddings;
 mod handover;
 mod lock;
@@ -79,6 +80,21 @@ enum Commands {
         source: PathBuf,
         #[arg(long)]
         bank: String,
+    },
+    /// Self-diagnostics: data root/model-cache permissions, bank
+    /// resolution, lock staleness, whether the embedder actually loads.
+    /// Read-only by default; --fix reclaims a real stale lock, the one
+    /// repairable thing in this surface today.
+    Doctor {
+        /// Skip the real embedder-load check (network-capable, slower).
+        #[arg(long)]
+        quick: bool,
+        /// Reclaim a stale lock, if the resolved bank has one. The only
+        /// mutation this command ever makes, and only with this flag.
+        #[arg(long)]
+        fix: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -212,6 +228,24 @@ replaced entirely by this embedding-based approach — it produced 435
 false positives on this same bank from shared templated section-header
 vocabulary at a low threshold, a weaker signal than the local embedding
 model already available in this project's own toolchain.
+
+## Doctor (self-diagnostics)
+
+    trm doctor
+    trm doctor --quick          # skip the real embedder-load check
+    trm doctor --fix            # also reclaim a stale lock, if any
+    trm doctor --json
+
+Checks the resolved bank's real failure surface: data root writable,
+bank resolution + whether it's been created yet (not created is a warn,
+not a fail — banks are lazily created on first write), lock staleness
+(read-only unless `--fix`), model cache reachable, and whether the
+embedder actually loads for real (skipped under `--quick` — this one
+check covers both `recall` and `stage()`'s concept-split viability, so
+it's reported once, not twice). Exit code 0 unless a real `Fail` shows
+up; warnings don't fail the run. `--fix` is the only thing this command
+ever mutates, and only reclaims a lock already confirmed stale (dead
+pid) — never a live one.
 
 ## Where facts live
 
@@ -410,6 +444,38 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Commands::Doctor { quick, fix, json } => {
+            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            let paths = bank::paths_for(&data_root, &bank_id);
+
+            if fix {
+                match doctor::fix(&paths) {
+                    Some(msg) => println!("fix: {msg}"),
+                    None => println!("fix: nothing to fix"),
+                }
+            }
+
+            let report = doctor::run(&data_root, &cwd, quick);
+            if json {
+                println!("{}", report.to_json());
+            } else {
+                for check in &report.checks {
+                    let label = match check.status {
+                        doctor::Status::Pass => "PASS",
+                        doctor::Status::Warn => "WARN",
+                        doctor::Status::Fail => "FAIL",
+                        doctor::Status::Skipped => "SKIP",
+                    };
+                    println!("{label:>4}  {}: {}", check.name, check.message);
+                }
+            }
+
+            if report.has_failures() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Commands::Skill { action } => match action {
             SkillAction::Get { topic } => match topic.as_str() {
                 "core" => {
