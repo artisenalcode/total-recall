@@ -72,7 +72,7 @@ fn try_create(lock_path: &Path) -> std::io::Result<()> {
     write!(file, "pid={pid}\nacquired_at={now}\n")
 }
 
-fn parse_pid(contents: &str) -> Option<u32> {
+pub(crate) fn parse_pid(contents: &str) -> Option<u32> {
     contents
         .lines()
         .find_map(|line| line.strip_prefix("pid="))
@@ -82,7 +82,9 @@ fn parse_pid(contents: &str) -> Option<u32> {
 /// Linux-only liveness check (this project's target environment) via
 /// /proc/<pid>. Not portable to macOS/Windows — deliberately not
 /// abstracted yet per this session's "no premature abstraction" call.
-fn is_pid_alive(pid: u32) -> bool {
+/// `pub(crate)` (not private) so `doctor.rs` can report lock staleness
+/// read-only, without calling `acquire` (which would mutate).
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
