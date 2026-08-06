@@ -84,6 +84,12 @@ pub struct RankedMatch {
     pub slug: String,
     pub score: f32,
     pub snippet: String,
+    /// Char offset into the source file of the window that produced this
+    /// match's score — so a caller can tell *why* a long file matched
+    /// (which part), not just that it did. 0 for a file short enough to
+    /// be a single window (the common case, unchanged from before
+    /// windowing existed).
+    pub window_offset: usize,
 }
 
 /// Semantic recall: rank every entry in `wiki_dir` by cosine similarity
@@ -105,23 +111,52 @@ pub fn semantic_search(
         return Ok(Vec::new());
     }
 
-    let mut texts = Vec::with_capacity(slugs.len() + 1);
-    texts.push(query.to_string());
-    for slug in &slugs {
-        texts.push(read(wiki_dir, slug).map_err(|e| e.to_string())?);
+    // Window every candidate file (a short file — the common case —
+    // produces exactly one window, so this is a no-op cost-wise for
+    // anything that was already fine). Every window across every file,
+    // plus the query, is embedded in one batched call.
+    let mut texts = vec![query.to_string()];
+    let mut owner_slug_idx = Vec::new();
+    let mut owner_offset = Vec::new();
+    for (slug_idx, slug) in slugs.iter().enumerate() {
+        let content = read(wiki_dir, slug).map_err(|e| e.to_string())?;
+        for (offset, window_text) in crate::window::windows(
+            &content,
+            crate::window::WINDOW_WORDS,
+            crate::window::OVERLAP_WORDS,
+        ) {
+            texts.push(window_text);
+            owner_slug_idx.push(slug_idx);
+            owner_offset.push(offset);
+        }
     }
 
     let vectors = embedder.embed(&texts)?;
     let query_vec = &vectors[0];
 
+    // Max score per source file — a file matches as well as its
+    // best-matching window, and that window's text/offset become the
+    // reported snippet/window_offset so a caller can tell *why* it
+    // matched, not just that it did.
+    let mut best: Vec<Option<(f32, usize, usize)>> = vec![None; slugs.len()];
+    for (window_i, (&slug_idx, &offset)) in owner_slug_idx.iter().zip(&owner_offset).enumerate() {
+        let score = crate::embeddings::cosine_similarity(query_vec, &vectors[window_i + 1]);
+        let current = &mut best[slug_idx];
+        if current.is_none_or(|(best_score, _, _)| score > best_score) {
+            *current = Some((score, offset, window_i));
+        }
+    }
+
     let mut matches: Vec<RankedMatch> = slugs
         .into_iter()
-        .zip(vectors.iter().skip(1))
-        .zip(texts.iter().skip(1))
-        .map(|((slug, vec), content)| RankedMatch {
-            slug,
-            score: crate::embeddings::cosine_similarity(query_vec, vec),
-            snippet: snippet_of(content),
+        .zip(best)
+        .filter_map(|(slug, hit)| {
+            hit.map(|(score, offset, window_i)| RankedMatch {
+                slug,
+                score,
+                snippet: snippet_of(&texts[window_i + 1]),
+                window_offset: offset,
+            })
         })
         .filter(|m| m.score >= min_score)
         .collect();
@@ -291,5 +326,53 @@ mod tests {
         let snippet = snippet_of(&long);
         assert!(snippet.ends_with('…'));
         assert!(snippet.chars().count() <= 121);
+    }
+
+    /// The real regression this whole fix exists for: a distinctive phrase
+    /// sitting past the old whole-file-embedding truncation point (>300
+    /// words of unrelated filler before it — comfortably past the ~211-261
+    /// word real ceiling measured in embeddings.rs's probe) must still be
+    /// found. Before windowing, this returns empty — the file's embedding
+    /// never saw the phrase at all.
+    ///
+    /// min_score here is 0.25, not the library-wide 0.3 recall default —
+    /// measured (window.rs's module doc), not guessed: this fixture is
+    /// deliberately worst-case (a real point diluted by 600 words of a
+    /// single unrelated topic, not realistic mixed-topic content), and
+    /// real scores against it cluster at 0.28-0.30 regardless of window
+    /// size. The fix under test is "0 matches -> a real, findable match,"
+    /// not "always clears an arbitrary universal floor on adversarial
+    /// content" — real session/doc content mixing related sub-topics
+    /// should score better than this intentionally-hard fixture.
+    #[test]
+    fn semantic_search_finds_a_match_buried_past_the_old_truncation_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let filler =
+            "unrelated filler content about gardening tips and weather patterns ".repeat(60);
+        let content = format!(
+            "{filler}The quarterly onboarding checklist requires manager signoff before day three."
+        );
+        write_named(tmp.path(), "long-doc", &content).unwrap();
+
+        let mut e = embedder();
+        let matches = semantic_search(
+            tmp.path(),
+            "manager signoff onboarding checklist requirement",
+            &mut e,
+            0.25,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            matches.len(),
+            1,
+            "the buried phrase should be found once windowing embeds the part of the file that actually contains it"
+        );
+        assert_eq!(matches[0].slug, "long-doc");
+        assert!(
+            matches[0].window_offset > 0,
+            "the matching window should be the later one, not the file's start"
+        );
     }
 }
