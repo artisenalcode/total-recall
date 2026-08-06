@@ -31,12 +31,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Store a single fact directly into the resolved bank's wiki tier.
-    Retain { content: String },
+    /// Omit `content` to read from stdin instead — no shell-argument size
+    /// limit, no quoting/escaping fragility for large content (unlike a
+    /// positional argument, which Linux caps around 128KB per element).
+    Retain { content: Option<String> },
     /// Case-insensitive substring search across the resolved bank's wiki tier.
     Recall { query: String },
     /// Stage raw content for a sub-agent handover (extraction), per ADR-0002.
+    /// Omit `content` to read from stdin instead — same reasoning as `retain`.
     Stage {
-        content: String,
+        content: Option<String>,
         #[arg(long)]
         reason: String,
         /// Provenance label. "direct" (default) is trusted; anything else
@@ -91,6 +95,7 @@ const CORE_DOCS: &str = r#"# trm — canonical memory CLI
 ## Retain a fact
 
     trm retain "<content>"
+    <content-source> | trm retain          # stdin, since 2026-08-07
 
 Writes into the bank resolved from your current directory:
 - explicit `-p/--bank <id>` if given
@@ -98,10 +103,18 @@ Writes into the bank resolved from your current directory:
 - else a stable hash of the enclosing repo's path (no remote configured)
 - else "global", if you're not inside any git repo
 
+`content` is optional — omit it to read from stdin instead. Prefer stdin
+for anything large or programmatically generated: a positional argument
+is a real, hard Linux limit (~128KB per argv element, `MAX_ARG_STRLEN`),
+found the hard way when a caller (`session_to_trm.py`) needed its own
+argv-length guard before this existed. Stdin has no such ceiling and
+avoids shell quoting/escaping fragility on multi-line content.
+
 Examples:
 
     trm retain "user prefers terse commit messages"          # -> bank for cwd's repo
     trm -p global retain "cross-project preference: X"        # -> forces the global bank
+    cat large-note.md | trm retain                            # -> stdin, no argv limit
 
 ## Recall a fact
 
@@ -128,6 +141,7 @@ alone to recover from a large blob.
 ## Handover (extraction/curation trm can't do itself — see ADR-0002)
 
     trm stage "<raw content>" --reason "<why this needs judgment>" [--source direct]
+    <content-source> | trm stage --reason "..." [--source direct]   # stdin, since 2026-08-07
     trm pending [--all]
     trm pending-show <job-id>
     trm complete-handover <job-id> "<result>"
@@ -217,6 +231,29 @@ proven first, per the user's own sequencing call) — real Kimi session data
 exists on disk, nothing reads it into trm yet.
 "#;
 
+/// Resolve content from the positional argument if given, otherwise
+/// stdin — the same harness-agnostic pattern squishi's `read_input`
+/// already proved out. Refuses to block reading from an interactive
+/// terminal with neither: that's almost always a forgotten argument, not
+/// someone about to type content, and hanging silently is the worst
+/// failure mode for a tool meant to sit in an automated pipeline.
+fn read_content_or_stdin(content: Option<String>) -> Result<String, String> {
+    if let Some(content) = content {
+        return Ok(content);
+    }
+    if std::io::IsTerminal::is_terminal(&io::stdin()) {
+        return Err(
+            "no content argument given and stdin is a terminal (not a pipe) — \
+             pass content as an argument or pipe it in, e.g. `cat file | trm retain`"
+                .to_string(),
+        );
+    }
+    let mut buf = String::new();
+    io::Read::read_to_string(&mut io::stdin(), &mut buf)
+        .map_err(|e| format!("failed to read stdin: {e}"))?;
+    Ok(buf)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().expect("cwd must be readable");
@@ -224,6 +261,13 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Retain { content } => {
+            let content = match read_content_or_stdin(content) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("trm retain failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             match retain(&data_root, &cwd, cli.bank.as_deref(), &content) {
                 Ok(slug) => {
                     println!("retained: {slug}");
@@ -256,6 +300,13 @@ fn main() -> ExitCode {
             reason,
             source,
         } => {
+            let content = match read_content_or_stdin(content) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("trm stage failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             match stage(
                 &data_root,
                 &cwd,
