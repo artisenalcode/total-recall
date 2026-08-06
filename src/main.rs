@@ -3,6 +3,7 @@ mod bank;
 mod concepts;
 mod curator;
 mod doctor;
+mod embed_cache;
 mod embeddings;
 mod handover;
 mod lock;
