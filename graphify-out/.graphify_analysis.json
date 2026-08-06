@@ -1,0 +1,369 @@
+{
+  "communities": {
+    "0": [
+      "src_bank",
+      "src_bank_append_index_entry",
+      "src_bank_append_index_entry_adds_a_line_with_slug_and_summary",
+      "src_bank_data_root",
+      "src_bank_empty_mf_bank_file_falls_through_to_hash",
+      "src_bank_ensure_index",
+      "src_bank_ensure_index_creates_template_once_and_is_idempotent",
+      "src_bank_explicit_flag_still_beats_mf_bank_file",
+      "src_bank_explicit_flag_wins_over_everything",
+      "src_bank_find_repo_root",
+      "src_bank_git_remote_slug",
+      "src_bank_hash_path_id",
+      "src_bank_init_repo",
+      "src_bank_mf_bank_file",
+      "src_bank_mf_bank_file_applies_from_a_subdirectory_too",
+      "src_bank_mf_bank_file_overrides_hash_fallback_when_no_remote",
+      "src_bank_mf_bank_file_overrides_remote_derived_name",
+      "src_bank_outside_any_repo_resolves_to_global",
+      "src_bank_paths_for",
+      "src_bank_paths_for_derives_the_four_bank_subpaths",
+      "src_bank_repo_with_origin_remote_uses_remote_slug",
+      "src_bank_repo_without_remote_falls_back_to_path_hash",
+      "src_bank_resolve_bank_id",
+      "src_bank_resolves_from_a_subdirectory_of_the_repo",
+      "src_bank_rs_option",
+      "src_bank_rs_path",
+      "src_bank_rs_pathbuf",
+      "src_bank_rs_result",
+      "src_bank_rs_string",
+      "src_bank_set_remote",
+      "src_bank_slugify_remote_url",
+      "src_bank_summarize",
+      "src_bank_summarize_leaves_short_content_untouched",
+      "src_bank_summarize_truncates_long_content_with_ellipsis",
+      "src_bank_two_different_repos_resolve_to_different_banks"
+    ],
+    "1": [
+      "into",
+      "src_bank_bankpaths",
+      "src_handover",
+      "src_handover_as_prompt_includes_kind_description_and_sources",
+      "src_handover_complete",
+      "src_handover_complete_writes_wiki_entry_updates_index_and_clears_pending",
+      "src_handover_direct_source_gets_no_untrusted_warning",
+      "src_handover_external_source_gets_untrusted_warning",
+      "src_handover_get_prompt",
+      "src_handover_get_prompt_returns_the_exact_rendered_marker_content",
+      "src_handover_handoverkind",
+      "src_handover_handovertask",
+      "src_handover_handovertask_as_prompt",
+      "src_handover_handovertask_is_trusted",
+      "src_handover_handovertask_new",
+      "src_handover_internal_source_gets_no_untrusted_warning",
+      "src_handover_list_pending",
+      "src_handover_list_pending_all_banks",
+      "src_handover_list_pending_all_banks_excludes_completed_jobs",
+      "src_handover_list_pending_all_banks_finds_jobs_across_multiple_banks",
+      "src_handover_list_pending_all_banks_on_empty_data_root_is_empty",
+      "src_handover_list_pending_on_untouched_bank_is_empty",
+      "src_handover_list_pending_returns_staged_job_ids",
+      "src_handover_rs_path",
+      "src_handover_rs_pathbuf",
+      "src_handover_rs_result",
+      "src_handover_rs_self",
+      "src_handover_rs_string",
+      "src_handover_rs_tempdir",
+      "src_handover_rs_vec",
+      "src_handover_stage",
+      "src_handover_stage_with_non_direct_source_flags_untrusted_in_marker",
+      "src_handover_stage_writes_raw_content_and_a_pending_marker",
+      "src_handover_test_paths"
+    ],
+    "2": [
+      "exitcode",
+      "src_main",
+      "src_main_cli",
+      "src_main_commands",
+      "src_main_complete_handover",
+      "src_main_core_docs_covers_recall",
+      "src_main_core_docs_covers_retain_and_bank_resolution",
+      "src_main_curator_scan",
+      "src_main_explicit_bank_flag_overrides_auto_resolution",
+      "src_main_find_md_files",
+      "src_main_import",
+      "src_main_import_walks_subdirectories_and_skips_memory_md_index",
+      "src_main_import_writes_named_entries_and_index",
+      "src_main_main",
+      "src_main_pending",
+      "src_main_pending_show",
+      "src_main_pending_show_returns_the_rendered_prompt_for_the_resolved_bank",
+      "src_main_recall",
+      "src_main_retain",
+      "src_main_retain_from_two_different_repos_lands_in_two_different_banks",
+      "src_main_retain_writes_wiki_file_and_index_entry_in_resolved_bank",
+      "src_main_rs_option",
+      "src_main_rs_path",
+      "src_main_rs_pathbuf",
+      "src_main_rs_result",
+      "src_main_rs_string",
+      "src_main_rs_vec",
+      "src_main_skillaction",
+      "src_main_stage",
+      "src_main_stage_pending_and_complete_handover_round_trip",
+      "src_main_strip_frontmatter",
+      "src_main_strip_frontmatter_leaves_content_without_frontmatter_untouched",
+      "src_main_strip_frontmatter_removes_yaml_block"
+    ],
+    "3": [
+      "src_wiki",
+      "src_wiki_embedder",
+      "src_wiki_list",
+      "src_wiki_list_on_missing_dir_returns_empty_not_error",
+      "src_wiki_list_returns_all_written_slugs_sorted",
+      "src_wiki_rankedmatch",
+      "src_wiki_read",
+      "src_wiki_rs_path",
+      "src_wiki_rs_result",
+      "src_wiki_rs_string",
+      "src_wiki_rs_vec",
+      "src_wiki_semantic_search",
+      "src_wiki_semantic_search_on_empty_bank_returns_empty_without_loading_a_model",
+      "src_wiki_semantic_search_ranks_the_closer_match_first",
+      "src_wiki_semantic_search_respects_limit",
+      "src_wiki_semantic_search_respects_min_score_floor",
+      "src_wiki_slugify",
+      "src_wiki_snippet_of",
+      "src_wiki_snippet_of_truncates_long_content_with_ellipsis",
+      "src_wiki_two_different_contents_do_not_collide",
+      "src_wiki_write",
+      "src_wiki_write_leaves_no_stray_temp_files_behind",
+      "src_wiki_write_named",
+      "src_wiki_write_named_preserves_the_exact_given_slug",
+      "src_wiki_write_then_read_round_trips_content"
+    ],
+    "4": [
+      "display",
+      "drop",
+      "formatter",
+      "src_lock",
+      "src_lock_acquire",
+      "src_lock_acquire_on_fresh_bank_succeeds_and_writes_our_pid",
+      "src_lock_acquiring_a_live_held_lock_fails_fast",
+      "src_lock_acquiring_a_stale_dead_pid_lock_reclaims_it",
+      "src_lock_is_pid_alive",
+      "src_lock_lockerror",
+      "src_lock_lockerror_fmt",
+      "src_lock_lockguard",
+      "src_lock_lockguard_drop",
+      "src_lock_parse_pid",
+      "src_lock_reacquire_after_release_succeeds",
+      "src_lock_release_removes_the_lease_file",
+      "src_lock_rs_option",
+      "src_lock_rs_path",
+      "src_lock_rs_pathbuf",
+      "src_lock_rs_result",
+      "src_lock_rs_string",
+      "src_lock_try_create"
+    ],
+    "5": [
+      "duration",
+      "src_embeddings",
+      "src_embeddings_acquire_with_retry",
+      "src_embeddings_build_model",
+      "src_embeddings_concurrent_first_time_downloads_do_not_corrupt_each_other",
+      "src_embeddings_cosine_similarity",
+      "src_embeddings_cosine_similarity_of_identical_vectors_is_one",
+      "src_embeddings_cosine_similarity_of_opposite_vectors_is_negative_one",
+      "src_embeddings_cosine_similarity_of_orthogonal_vectors_is_zero",
+      "src_embeddings_cosine_similarity_with_zero_vector_is_zero_not_nan",
+      "src_embeddings_embedder",
+      "src_embeddings_embedder_embed",
+      "src_embeddings_embedder_new",
+      "src_embeddings_once_warm_concurrent_loads_all_succeed_quickly_via_retry",
+      "src_embeddings_rs_path",
+      "src_embeddings_rs_pathbuf",
+      "src_embeddings_rs_result",
+      "src_embeddings_rs_self",
+      "src_embeddings_rs_string",
+      "src_embeddings_rs_vec",
+      "textembedding"
+    ],
+    "6": [
+      "src_curator",
+      "src_curator_empty_bank_produces_no_candidates",
+      "src_curator_exact_dup_pair_is_not_also_staged_by_the_fuzzy_pass",
+      "src_curator_exact_duplicate_content_is_staged_as_exact_dup_not_fuzzy_curation",
+      "src_curator_fully_contained_content_is_staged_as_exact_dup",
+      "src_curator_is_exact_or_contained",
+      "src_curator_non_duplicate_entries_still_reach_the_similarity_pass",
+      "src_curator_rs_result",
+      "src_curator_rs_string",
+      "src_curator_rs_tempdir",
+      "src_curator_rs_vec",
+      "src_curator_scan",
+      "src_curator_semantically_similar_entries_get_staged_as_curation_candidates",
+      "src_curator_single_entry_bank_produces_no_candidates_without_loading_a_model",
+      "src_curator_stage_candidate",
+      "src_curator_staged_curation_marker_names_both_entries_and_similarity",
+      "src_curator_test_paths",
+      "src_curator_unrelated_entries_are_not_staged"
+    ],
+    "7": [
+      "src_atomic",
+      "src_atomic_rs_path",
+      "src_atomic_rs_result",
+      "src_atomic_write",
+      "src_atomic_write_creates_final_file_with_no_leftover_temp",
+      "src_atomic_write_overwrites_existing_file"
+    ],
+    "8": [
+      "crate:total-recall"
+    ]
+  },
+  "cohesion": {
+    "0": 0.12941176470588237,
+    "1": 0.1497326203208556,
+    "2": 0.17613636363636365,
+    "3": 0.20333333333333334,
+    "4": 0.16883116883116883,
+    "5": 0.1523809523809524,
+    "6": 0.24183006535947713,
+    "7": 0.5333333333333333,
+    "8": 1.0
+  },
+  "gods": [
+    {
+      "id": "src_curator_scan",
+      "label": "scan()",
+      "degree": 14
+    },
+    {
+      "id": "src_handover_stage",
+      "label": "stage()",
+      "degree": 13
+    },
+    {
+      "id": "src_lock_acquire",
+      "label": "acquire()",
+      "degree": 13
+    },
+    {
+      "id": "src_curator_test_paths",
+      "label": "test_paths()",
+      "degree": 12
+    },
+    {
+      "id": "src_wiki_semantic_search",
+      "label": "semantic_search()",
+      "degree": 12
+    },
+    {
+      "id": "src_bank_bankpaths",
+      "label": "BankPaths",
+      "degree": 11
+    },
+    {
+      "id": "src_bank_init_repo",
+      "label": "init_repo()",
+      "degree": 11
+    },
+    {
+      "id": "src_main_main",
+      "label": "main()",
+      "degree": 10
+    },
+    {
+      "id": "src_wiki_write",
+      "label": "write()",
+      "degree": 10
+    },
+    {
+      "id": "src_bank_resolve_bank_id",
+      "label": "resolve_bank_id()",
+      "degree": 9
+    }
+  ],
+  "surprises": [
+    {
+      "source": "scan()",
+      "target": "BankPaths",
+      "source_files": [
+        "src/curator.rs",
+        "src/bank.rs"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "bridges separate communities"
+    },
+    {
+      "source": "stage_candidate()",
+      "target": "BankPaths",
+      "source_files": [
+        "src/curator.rs",
+        "src/bank.rs"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "bridges separate communities"
+    },
+    {
+      "source": "test_paths()",
+      "target": "BankPaths",
+      "source_files": [
+        "src/curator.rs",
+        "src/bank.rs"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "bridges separate communities"
+    },
+    {
+      "source": "semantic_search()",
+      "target": "Embedder",
+      "source_files": [
+        "src/wiki.rs",
+        "src/embeddings.rs"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "bridges separate communities"
+    },
+    {
+      "source": "acquire_with_retry()",
+      "target": "LockGuard",
+      "source_files": [
+        "src/embeddings.rs",
+        "src/lock.rs"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "bridges separate communities"
+    }
+  ],
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `BankPaths` connect `Community 1` to `Community 0`, `Community 6`?",
+      "why": "High betweenness centrality (0.421) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `semantic_search()` connect `Community 3` to `Community 5`?",
+      "why": "High betweenness centrality (0.359) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `Embedder` connect `Community 5` to `Community 3`?",
+      "why": "High betweenness centrality (0.341) - this node is a cross-community bridge."
+    },
+    {
+      "type": "isolated_nodes",
+      "question": "What connects `total-recall` to the rest of the system?",
+      "why": "1 weakly-connected nodes found - possible documentation gaps or missing edges."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Community 0` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.12941176470588237 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Community 1` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.1497326203208556 - nodes in this community are weakly interconnected."
+    }
+  ]
+}
