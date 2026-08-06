@@ -233,6 +233,89 @@ mod tests {
     }
 
     #[test]
+    fn scan_completes_within_a_bounded_time_at_realistic_bank_scale() {
+        // `scan` re-embeds every entry on every call (no content-hash
+        // skip-cache exists yet — flagged as a known gap, not fixed
+        // here). This is a tripwire, not a performance guarantee: it
+        // catches a future regression (or confirms a future cache
+        // actually helps) rather than asserting a specific budget is
+        // optimal. 50 entries is a realistic single-bank size, not a
+        // stress-test extreme.
+        // Genuinely distinct topics, not a shared template with a number
+        // swapped in — a near-identical template embeds as near-identical
+        // regardless of the number, which would make every pair a false
+        // positive and defeat the point of a negative control.
+        const TOPICS: [&str; 50] = [
+            "the user prefers tabs over spaces in Python",
+            "podman containers require explicit network setup on this host",
+            "the coffee machine in the office needs descaling monthly",
+            "quarterly revenue grew twelve percent year over year",
+            "the cat is allergic to a specific brand of cat litter",
+            "rust's borrow checker rejects this pattern at compile time",
+            "the hiking trail closes seasonally due to snowfall",
+            "the invoice template needs a new tax line item",
+            "the guitar has a buzzing fret on the low E string",
+            "database migrations must run before the app boots",
+            "the recipe calls for browned butter, not melted",
+            "the flight was delayed due to a mechanical issue",
+            "the garden needs more shade for the ferns",
+            "the meeting was rescheduled to Thursday afternoon",
+            "the printer is out of magenta toner again",
+            "the bridge is closed for structural repairs",
+            "the API rate limit resets at midnight UTC",
+            "the dog needs a rabies booster this year",
+            "the novel's plot twist happens in chapter twelve",
+            "the thermostat schedule needs updating for winter",
+            "the client wants the logo in a warmer blue",
+            "the marathon route changed due to construction",
+            "the spreadsheet formula has a circular reference",
+            "the plane's boarding group was announced early",
+            "the orchestra is rehearsing a new symphony",
+            "the server's disk usage crossed eighty percent",
+            "the bakery sells out of croissants by nine",
+            "the lecture covered thermodynamics in depth",
+            "the router firmware update fixed the dropouts",
+            "the museum exhibit closes at the end of the month",
+            "the compiler warning points to an unused import",
+            "the vineyard's harvest starts earlier this year",
+            "the subway line is running a reduced schedule",
+            "the thesis defense is scheduled for next week",
+            "the greenhouse humidity sensor needs calibration",
+            "the podcast episode ran twenty minutes over",
+            "the firmware bug only reproduces on cold boot",
+            "the choir is learning a piece in a minor key",
+            "the tide pools are best visited at low tide",
+            "the spreadsheet macro fails on empty rows",
+            "the violin needs new strings before the recital",
+            "the drone's battery lasts about twenty minutes",
+            "the bakery's sourdough starter is ten years old",
+            "the satellite passes overhead twice a day",
+            "the lecture hall projector needs a new bulb",
+            "the marathon training plan peaks in week ten",
+            "the greenhouse tomatoes are ready to harvest",
+            "the orchestra's brass section needs more rehearsal",
+            "the router's firmware has a known security patch",
+            "the museum's new wing opens next spring",
+        ];
+        let (_data_root, paths) = test_paths();
+        for (i, topic) in TOPICS.iter().enumerate() {
+            wiki::write_named(&paths.wiki, &format!("entry-{i}"), topic).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let staged = scan(&paths, 0.9).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_secs() < 30,
+            "scan of 50 entries took {elapsed:?}, expected well under 30s"
+        );
+        // Genuinely distinct topics at a high (0.9) threshold shouldn't
+        // false-positive into staged candidates.
+        assert!(staged.is_empty(), "unexpected candidates: {staged:?}");
+    }
+
+    #[test]
     fn non_duplicate_entries_still_reach_the_similarity_pass() {
         let (_data_root, paths) = test_paths();
         wiki::write_named(
