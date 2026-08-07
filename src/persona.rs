@@ -18,6 +18,77 @@ pub struct VideoTarget {
     pub title: String,
 }
 
+/// GitHub's own stable "latest" release-asset redirect — no scraping,
+/// no version pinning to go stale, no need to parse a releases page at
+/// all. Verified live (2026-08-07): two redirects through GitHub's
+/// release-asset CDN, then a real 200 with the actual ~3MB Linux
+/// standalone binary.
+const YT_DLP_LATEST_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+
+/// Resolve a usable `yt-dlp` binary: PATH first, then a locally cached
+/// copy under `<data_root>/bin/yt-dlp`, downloading a fresh one via a
+/// real (synchronous, no tokio) HTTP GET if neither exists.
+///
+/// Real finding (2026-08-07): the `yt-dlp` *Rust crate* that wraps this
+/// same binary requires GPL-3.0 plus a full tokio/reqwest async stack
+/// just to auto-provision one helper executable — a real mismatch with
+/// this project's own repeated minimal-dependency choices this session
+/// (hand-rolled JSON, shelling to `date` instead of adding `chrono`,
+/// ...). This does the same auto-provisioning job with `ureq` (sync,
+/// no async runtime) and links no GPL code into this binary — we
+/// already depend on the external `yt-dlp` executable at runtime
+/// either way; this only changes who fetches it.
+pub fn ensure_yt_dlp(data_root: &Path) -> Result<PathBuf, String> {
+    if yt_dlp_on_path() {
+        return Ok(PathBuf::from("yt-dlp"));
+    }
+
+    let cached = data_root.join("bin").join("yt-dlp");
+    if cached.is_file() {
+        return Ok(cached);
+    }
+
+    download_yt_dlp(&cached)?;
+    Ok(cached)
+}
+
+fn yt_dlp_on_path() -> bool {
+    Command::new("yt-dlp")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn download_yt_dlp(dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let bytes: Vec<u8> = ureq::get(YT_DLP_LATEST_URL)
+        .call()
+        .map_err(|e| format!("failed to download yt-dlp: {e}"))?
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| format!("failed to read yt-dlp download body: {e}"))?;
+
+    // Write to a temp path first, then rename — same atomic-write
+    // discipline as everything else this crate persists (see
+    // `atomic::write`), so a killed/interrupted download never leaves a
+    // corrupt binary sitting at the real path.
+    let tmp = dest.with_extension("download-tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+
+    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Strip VTT structure (WEBVTT/Kind/Language headers, timing cue lines,
 /// inline `<...>` tags), collapse consecutive rolling-caption duplicate
 /// lines, and decode the handful of HTML entities real auto-captions
@@ -139,9 +210,13 @@ fn select_largest(paths: &[PathBuf]) -> Option<PathBuf> {
 /// (9,044 words) sitting right next to it. Byte size is the real,
 /// robust signal — the fuller transcript is always larger — not
 /// filename ordering.
-pub fn fetch_captions(video_id: &str, work_dir: &Path) -> Result<String, String> {
+pub fn fetch_captions(
+    yt_dlp_bin: &Path,
+    video_id: &str,
+    work_dir: &Path,
+) -> Result<String, String> {
     let stem = work_dir.join(video_id);
-    let output = Command::new("yt-dlp")
+    let output = Command::new(yt_dlp_bin)
         .args([
             "--skip-download",
             "--write-auto-sub",
@@ -155,7 +230,7 @@ pub fn fetch_captions(video_id: &str, work_dir: &Path) -> Result<String, String>
         .arg(format!("{}.%(ext)s", stem.display()))
         .arg(format!("https://www.youtube.com/watch?v={video_id}"))
         .output()
-        .map_err(|e| format!("yt-dlp not on PATH: {e}"))?;
+        .map_err(|e| format!("failed to run {}: {e}", yt_dlp_bin.display()))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -198,20 +273,25 @@ pub fn fetch_captions(video_id: &str, work_dir: &Path) -> Result<String, String>
 /// content — consistent with this being raw material awaiting a
 /// sub-agent's synthesis judgment, not yet a durable fact). Returns the
 /// written file paths, in order — callers hand these straight to
-/// `handover::stage_persona_sources`.
+/// `handover::stage_persona_sources`. Resolves (and caches, if needed)
+/// the `yt-dlp` binary once for the whole batch via `ensure_yt_dlp`,
+/// not once per video.
 pub fn ingest_videos(
+    data_root: &Path,
     raw_dir: &Path,
     person: &str,
     slug: &str,
     videos: &[VideoTarget],
     ingested_date: &str,
 ) -> Result<Vec<PathBuf>, String> {
+    let yt_dlp_bin = ensure_yt_dlp(data_root)?;
+
     let person_dir = raw_dir.join(slug);
     std::fs::create_dir_all(&person_dir).map_err(|e| e.to_string())?;
 
     let mut written = Vec::with_capacity(videos.len());
     for video in videos {
-        let text = fetch_captions(&video.id, &person_dir)?;
+        let text = fetch_captions(&yt_dlp_bin, &video.id, &person_dir)?;
         let md = build_raw_transcript_md(person, slug, video, &text, ingested_date);
         let file_name = format!("yt-{}.md", video.id);
         let file_path = person_dir.join(&file_name);
@@ -312,19 +392,35 @@ mod tests {
         assert!(select_largest(&[]).is_none());
     }
 
+    /// Pre-seeds a fake cached `yt-dlp` binary so `ensure_yt_dlp` finds it
+    /// already cached and never touches the network — keeps this test
+    /// fast and deterministic regardless of whether the real `yt-dlp` is
+    /// on PATH in the environment running it. The stub always exits
+    /// non-zero, which is what actually drives the assertion: a real
+    /// video fetch failure must surface as a real `Err`, not hang or
+    /// silently produce an empty file.
+    fn seed_fake_failing_yt_dlp(data_root: &Path) {
+        let bin_dir = data_root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let stub = bin_dir.join("yt-dlp");
+        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
     #[test]
-    fn ingest_videos_returns_an_error_without_touching_the_network_when_yt_dlp_is_missing() {
-        // Real behavior check: a genuinely nonexistent video id against a
-        // scratch dir should fail cleanly (not panic), whether because
-        // yt-dlp is missing or the fetch itself fails — either way this
-        // proves ingest_videos surfaces a real Err rather than hanging or
-        // silently producing an empty file.
+    fn ingest_videos_returns_an_error_without_touching_the_network_when_yt_dlp_fails() {
         let tmp = tempfile::tempdir().unwrap();
+        seed_fake_failing_yt_dlp(tmp.path());
         let videos = vec![VideoTarget {
             id: "this-is-not-a-real-video-id-00000".to_string(),
             title: "irrelevant".to_string(),
         }];
         let result = ingest_videos(
+            tmp.path(),
             tmp.path(),
             "Test Person",
             "test-person",
