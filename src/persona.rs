@@ -183,6 +183,321 @@ pub fn build_raw_transcript_md(
     )
 }
 
+/// Wikipedia's own API etiquette requires a descriptive User-Agent
+/// identifying the tool and a contact point — unidentified requests get
+/// deprioritized/blocked. Same politeness convention already used by
+/// `advisory/tools/scrape_blog.py`'s own UA string.
+const WIKIPEDIA_USER_AGENT: &str = "trm-persona-ingest/1.0 (personal knowledge corpus; https://github.com/artisenalcode/total-recall)";
+
+/// Fetches the full plain-text extract of a Wikipedia article via the
+/// official MediaWiki Action API (`prop=extracts&explaintext=1`) — no
+/// HTML to parse, no scraping, real structured JSON. `redirects=1` so a
+/// title that's actually a redirect (common) still resolves.
+pub fn fetch_wikipedia(title: &str) -> Result<String, String> {
+    let body: String = ureq::get("https://en.wikipedia.org/w/api.php")
+        .header("User-Agent", WIKIPEDIA_USER_AGENT)
+        .query("action", "query")
+        .query("format", "json")
+        .query("prop", "extracts")
+        .query("explaintext", "1")
+        .query("redirects", "1")
+        .query("titles", title)
+        .call()
+        .map_err(|e| format!("Wikipedia request failed for {title:?}: {e}"))?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("bad Wikipedia JSON: {e}"))?;
+    let pages = json["query"]["pages"]
+        .as_object()
+        .ok_or_else(|| format!("unexpected Wikipedia response shape for {title:?}"))?;
+    let page = pages
+        .values()
+        .next()
+        .ok_or_else(|| format!("empty Wikipedia response for {title:?}"))?;
+
+    if page.get("missing").is_some() {
+        return Err(format!("Wikipedia page not found: {title:?}"));
+    }
+    let extract = page
+        .get("extract")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("no extract field for {title:?}"))?;
+    if extract.trim().is_empty() {
+        return Err(format!("empty Wikipedia extract for {title:?}"));
+    }
+    Ok(extract.trim().to_string())
+}
+
+/// Same frontmatter shape family as `build_raw_transcript_md`, adapted
+/// for a source with no video_id/transcript-type fields.
+pub fn build_wikipedia_raw_md(
+    person: &str,
+    slug: &str,
+    title: &str,
+    text: &str,
+    ingested_date: &str,
+) -> String {
+    let word_count = text.split_whitespace().count();
+    let url_title = title.replace(' ', "_");
+    format!(
+        "---\n\
+         source: https://en.wikipedia.org/wiki/{url_title}\n\
+         person: {person}\n\
+         person_slug: {slug}\n\
+         title: {title:?}\n\
+         type: wikipedia\n\
+         ingested: {ingested_date}\n\
+         word_count: {word_count}\n\
+         ---\n\n\
+         # {title}\n\n\
+         {text}\n"
+    )
+}
+
+/// Fetch+write raw Wikipedia article files, one per title, into
+/// `<bank>/raw/<slug>/` — same tier and same best-effort squishi-sidecar
+/// treatment as `ingest_videos`. Article titles are usually few (1-3 per
+/// person), so no batching/concurrency needed here unlike video fetches.
+pub fn ingest_wikipedia_pages(
+    raw_dir: &Path,
+    person: &str,
+    slug: &str,
+    titles: &[String],
+    ingested_date: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let person_dir = raw_dir.join(slug);
+    std::fs::create_dir_all(&person_dir).map_err(|e| e.to_string())?;
+
+    let mut written = Vec::with_capacity(titles.len());
+    for title in titles {
+        let text = fetch_wikipedia(title)?;
+        let md = build_wikipedia_raw_md(person, slug, title, &text, ingested_date);
+        let file_name = format!("wikipedia-{}.md", slugify(title));
+        let file_path = person_dir.join(&file_name);
+        atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
+        written.push(file_path);
+
+        if let Ok(dedup_json) = run_squishi_dedup(&text) {
+            let sidecar_path = person_dir.join(format!("wikipedia-{}.dedup.json", slugify(title)));
+            let _ = atomic::write(&sidecar_path, &dedup_json);
+        }
+    }
+    Ok(written)
+}
+
+/// Filesystem-safe stand-in for a title with spaces/punctuation — same
+/// job `ingest_youtube.py`'s own `slugify` does, kept minimal (no crate)
+/// since it's one regex-shaped substitution.
+fn slugify(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut last_was_dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// One commit's message, split into subject/body per `git log`'s own
+/// convention (first line vs. everything after the blank line).
+#[derive(Debug, Clone, PartialEq)]
+struct Commit {
+    date: String,
+    subject: String,
+    body: String,
+}
+
+/// Field/record separators that can't appear in real commit text —
+/// same choice `ingest_code_archaeology.py` makes (ASCII unit/record
+/// separators), not a delimiter a commit message could plausibly
+/// collide with the way a comma or pipe could.
+const GIT_LOG_FIELD_SEP: char = '\u{1f}';
+const GIT_LOG_RECORD_SEP: char = '\u{1e}';
+
+/// Clone (blob-less, no working tree — only history is needed) and
+/// extract one author's commit messages from a repo, oldest first.
+/// Merge commits are dropped ("Merge " subject prefix — GitHub's own
+/// words, not the person's). Rust port of `ingest_code_archaeology.py`'s
+/// `commits_by`, scoped to just the commit-message piece (that script's
+/// code-sample/doc extraction is a separate, larger feature, not
+/// ported here). `work_dir` holds the temporary clone, removed after
+/// extraction either way.
+pub fn fetch_git_commits(
+    repo_url: &str,
+    authors: &[String],
+    work_dir: &Path,
+) -> Result<String, String> {
+    if authors.is_empty() {
+        return Err("fetch_git_commits requires at least one author".to_string());
+    }
+
+    let repo_name = repo_url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit('/')
+        .next()
+        .unwrap_or("repo");
+    let clone_dir = work_dir.join(format!("git-clone-{repo_name}"));
+    let _ = std::fs::remove_dir_all(&clone_dir);
+
+    let clone_result = Command::new("git")
+        .args([
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            "-q",
+            repo_url,
+        ])
+        .arg(&clone_dir)
+        .output()
+        .map_err(|e| format!("failed to run git clone: {e}"))?;
+    if !clone_result.status.success() {
+        return Err(format!(
+            "git clone failed for {repo_url}: {}",
+            String::from_utf8_lossy(&clone_result.stderr).trim()
+        ));
+    }
+
+    let mut log_args = vec!["log".to_string(), "--all".to_string()];
+    for author in authors {
+        log_args.push(format!("--author={author}"));
+    }
+    log_args.push("--date=short".to_string());
+    log_args.push(format!(
+        "--pretty=format:%H{GIT_LOG_FIELD_SEP}%ad{GIT_LOG_FIELD_SEP}%s{GIT_LOG_FIELD_SEP}%b{GIT_LOG_RECORD_SEP}"
+    ));
+
+    let log_result = Command::new("git")
+        .args(&log_args)
+        .current_dir(&clone_dir)
+        .output()
+        .map_err(|e| format!("failed to run git log: {e}"));
+    let _ = std::fs::remove_dir_all(&clone_dir);
+    let log_result = log_result?;
+
+    if !log_result.status.success() {
+        return Err(format!(
+            "git log failed for {repo_url}: {}",
+            String::from_utf8_lossy(&log_result.stderr).trim()
+        ));
+    }
+
+    let commits = parse_git_log(&String::from_utf8_lossy(&log_result.stdout));
+    if commits.is_empty() {
+        return Err(format!(
+            "no commits found for author(s) {authors:?} in {repo_url}"
+        ));
+    }
+    Ok(render_commits(commits))
+}
+
+fn parse_git_log(raw: &str) -> Vec<Commit> {
+    raw.split(GIT_LOG_RECORD_SEP)
+        .filter_map(|record| {
+            let record = record.trim_matches('\n');
+            if record.is_empty() {
+                return None;
+            }
+            let mut fields = record.split(GIT_LOG_FIELD_SEP);
+            let _hash = fields.next()?;
+            let date = fields.next().unwrap_or("").to_string();
+            let subject = fields.next().unwrap_or("").trim().to_string();
+            let body = fields.next().unwrap_or("").trim().to_string();
+            if subject.starts_with("Merge ") {
+                return None;
+            }
+            Some(Commit {
+                date,
+                subject,
+                body,
+            })
+        })
+        .collect()
+}
+
+fn render_commits(mut commits: Vec<Commit>) -> String {
+    commits.sort_by(|a, b| a.date.cmp(&b.date));
+    commits
+        .into_iter()
+        .map(|c| {
+            if c.body.is_empty() {
+                format!("On {}: {}.", c.date, c.subject)
+            } else {
+                format!("On {}: {}. {}", c.date, c.subject, c.body)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Same frontmatter shape family as `build_wikipedia_raw_md`, for a
+/// commit-message corpus.
+pub fn build_git_commits_raw_md(
+    person: &str,
+    slug: &str,
+    repo_url: &str,
+    text: &str,
+    ingested_date: &str,
+) -> String {
+    let word_count = text.split_whitespace().count();
+    format!(
+        "---\n\
+         source: {repo_url}\n\
+         person: {person}\n\
+         person_slug: {slug}\n\
+         type: git-commit-messages\n\
+         ingested: {ingested_date}\n\
+         word_count: {word_count}\n\
+         ---\n\n\
+         # Commit messages from {repo_url}\n\n\
+         {text}\n"
+    )
+}
+
+/// Fetch+write one raw file of commit messages for a single repo — same
+/// tier and best-effort squishi-sidecar treatment as `ingest_videos`/
+/// `ingest_wikipedia_pages`. One repo per call, matching
+/// `ingest_code_archaeology.py`'s own scope (repeat the call for
+/// multiple repos).
+pub fn ingest_git_commits(
+    raw_dir: &Path,
+    person: &str,
+    slug: &str,
+    repo_url: &str,
+    authors: &[String],
+    ingested_date: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let person_dir = raw_dir.join(slug);
+    std::fs::create_dir_all(&person_dir).map_err(|e| e.to_string())?;
+
+    let text = fetch_git_commits(repo_url, authors, &person_dir)?;
+    let md = build_git_commits_raw_md(person, slug, repo_url, &text, ingested_date);
+    let repo_name = repo_url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit('/')
+        .next()
+        .unwrap_or("repo");
+    let file_name = format!("git-{}.md", slugify(repo_name));
+    let file_path = person_dir.join(&file_name);
+    atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
+
+    if let Ok(dedup_json) = run_squishi_dedup(&text) {
+        let sidecar_path = person_dir.join(format!("git-{}.dedup.json", slugify(repo_name)));
+        let _ = atomic::write(&sidecar_path, &dedup_json);
+    }
+
+    Ok(vec![file_path])
+}
+
 /// Pick the largest file among candidate caption-track variants — real,
 /// robust signal (a fuller transcript is always bigger), unlike
 /// filename ordering (see `fetch_captions`'s doc comment for the real
@@ -385,6 +700,156 @@ mod tests {
     fn clean_vtt_on_empty_input_returns_empty() {
         assert_eq!(clean_vtt(""), "");
         assert_eq!(clean_vtt("WEBVTT\nKind: captions\n"), "");
+    }
+
+    // --- parse_git_log / render_commits: pure ---
+
+    fn fake_git_log_output(records: &[(&str, &str, &str, &str)]) -> String {
+        records
+            .iter()
+            .map(|(hash, date, subject, body)| {
+                format!("{hash}{GIT_LOG_FIELD_SEP}{date}{GIT_LOG_FIELD_SEP}{subject}{GIT_LOG_FIELD_SEP}{body}{GIT_LOG_RECORD_SEP}")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_git_log_drops_merge_commits() {
+        let raw = fake_git_log_output(&[
+            ("abc123", "2026-01-01", "Merge pull request #4", ""),
+            ("def456", "2026-01-02", "Fix a real bug", "details here"),
+        ]);
+        let commits = parse_git_log(&raw);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "Fix a real bug");
+    }
+
+    #[test]
+    fn parse_git_log_keeps_commits_with_no_body() {
+        let raw = fake_git_log_output(&[("abc123", "2026-01-01", "One-line commit", "")]);
+        let commits = parse_git_log(&raw);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].body, "");
+    }
+
+    #[test]
+    fn parse_git_log_on_empty_input_returns_empty() {
+        assert!(parse_git_log("").is_empty());
+    }
+
+    #[test]
+    fn render_commits_sorts_by_date_and_formats_subject_and_body() {
+        let commits = vec![
+            Commit {
+                date: "2026-02-01".to_string(),
+                subject: "Second thing".to_string(),
+                body: "".to_string(),
+            },
+            Commit {
+                date: "2026-01-01".to_string(),
+                subject: "First thing".to_string(),
+                body: "with real detail".to_string(),
+            },
+        ];
+        let rendered = render_commits(commits);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "On 2026-01-01: First thing. with real detail");
+        assert_eq!(lines[1], "On 2026-02-01: Second thing.");
+    }
+
+    // --- build_git_commits_raw_md: pure ---
+
+    #[test]
+    fn build_git_commits_raw_md_matches_the_frontmatter_shape() {
+        let md = build_git_commits_raw_md(
+            "Jane Doe",
+            "jane-doe",
+            "https://github.com/example/repo",
+            "On 2026-01-01: did a thing.",
+            "2026-08-07",
+        );
+        assert!(md.starts_with("---\nsource: https://github.com/example/repo\n"));
+        assert!(md.contains("type: git-commit-messages\n"));
+        assert!(md.contains("# Commit messages from https://github.com/example/repo\n"));
+    }
+
+    // --- fetch_git_commits: real subprocess, #[ignore]d ---
+
+    #[test]
+    #[ignore]
+    fn fetch_git_commits_returns_real_commit_messages_for_a_real_author() {
+        let tmp = tempfile::tempdir().unwrap();
+        // GitHub's own public demo repo -- small, stable, genuinely
+        // public (unlike this account's own repos, which are private
+        // and correctly fail an unauthenticated clone -- a real finding
+        // from the first run of this test, not a bug in the fetch path).
+        let text = fetch_git_commits(
+            "https://github.com/octocat/Hello-World",
+            &["Octocat".to_string()],
+            tmp.path(),
+        );
+        assert!(text.is_ok(), "expected real commits: {:?}", text.err());
+        let text = text.unwrap();
+        assert!(!text.is_empty());
+        assert!(text.contains("On 20"), "expected a rendered date line");
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_git_commits_errors_on_a_real_nonexistent_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = fetch_git_commits(
+            "https://github.com/artisenalcode/this-repo-does-not-exist-at-all-12345",
+            &["someone".to_string()],
+            tmp.path(),
+        );
+        assert!(result.is_err());
+    }
+
+    // --- slugify: pure ---
+
+    #[test]
+    fn slugify_lowercases_and_dashes_spaces_and_punctuation() {
+        assert_eq!(slugify("Jordan B. Peterson"), "jordan-b-peterson");
+    }
+
+    #[test]
+    fn slugify_collapses_consecutive_separators_and_trims_edges() {
+        assert_eq!(slugify("  Dr. Roy   Sugarman!! "), "dr-roy-sugarman");
+    }
+
+    // --- build_wikipedia_raw_md: pure ---
+
+    #[test]
+    fn build_wikipedia_raw_md_matches_the_frontmatter_shape() {
+        let md = build_wikipedia_raw_md(
+            "Jordan Peterson",
+            "jordan-peterson",
+            "Jordan Peterson",
+            "real article text here",
+            "2026-08-07",
+        );
+        assert!(md.starts_with("---\nsource: https://en.wikipedia.org/wiki/Jordan_Peterson\n"));
+        assert!(md.contains("type: wikipedia\n"));
+        assert!(md.contains("word_count: 4\n"));
+        assert!(md.ends_with("# Jordan Peterson\n\nreal article text here\n"));
+    }
+
+    // --- fetch_wikipedia: real network, #[ignore]d ---
+
+    #[test]
+    #[ignore]
+    fn fetch_wikipedia_returns_real_article_text() {
+        let text = fetch_wikipedia("Jordan Peterson").unwrap();
+        assert!(text.len() > 500, "expected a substantial article extract");
+        assert!(text.to_lowercase().contains("psycholog"));
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_wikipedia_errors_on_a_real_nonexistent_title() {
+        let result = fetch_wikipedia("Zzzznotarealwikipediaarticletitle12345");
+        assert!(result.is_err());
     }
 
     #[test]

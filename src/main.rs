@@ -125,9 +125,27 @@ enum Commands {
         /// Repeatable: "<video_id>|<title>", e.g. --video
         /// "dQw4w9WgXcQ|A Real Talk Title". Hand-picked, not
         /// full-channel-enumerated -- matches this store's existing
-        /// per-advisor ingestion convention.
-        #[arg(long = "video", required = true)]
+        /// per-advisor ingestion convention. Not required on its own --
+        /// not every persona has a YouTube corpus (see --wikipedia);
+        /// at least one source across all flags is required.
+        #[arg(long = "video")]
         videos: Vec<String>,
+        /// Repeatable: a Wikipedia article title, e.g. "Jordan Peterson".
+        /// Fetched via the official MediaWiki API (plain-text extract,
+        /// no scraping) -- no auth, no rate-limit concerns for a handful
+        /// of titles.
+        #[arg(long = "wikipedia")]
+        wikipedia: Vec<String>,
+        /// A single git repo URL to pull commit messages from (one repo
+        /// per invocation, same scope as `advisory`'s own code-
+        /// archaeology ingester -- run again for a second repo).
+        /// Requires --git-author at least once.
+        #[arg(long = "git-repo")]
+        git_repo: Option<String>,
+        /// Repeatable: an author email to match commits by (same person
+        /// often uses more than one email across repos/years).
+        #[arg(long = "git-author")]
+        git_author: Vec<String>,
         #[arg(long, default_value = "direct")]
         source: String,
     },
@@ -598,8 +616,24 @@ fn main() -> ExitCode {
             person,
             slug,
             videos,
+            wikipedia,
+            git_repo,
+            git_author,
             source,
         } => {
+            if videos.is_empty() && wikipedia.is_empty() && git_repo.is_none() {
+                eprintln!(
+                    "trm ingest-persona failed: at least one source is required (--video, --wikipedia, and/or --git-repo)"
+                );
+                return ExitCode::FAILURE;
+            }
+            if git_repo.is_some() && git_author.is_empty() {
+                eprintln!(
+                    "trm ingest-persona failed: --git-repo requires at least one --git-author"
+                );
+                return ExitCode::FAILURE;
+            }
+
             let parsed: Result<Vec<persona::VideoTarget>, String> = videos
                 .iter()
                 .map(|v| match v.split_once('|') {
@@ -635,32 +669,67 @@ fn main() -> ExitCode {
             };
 
             let today = today_date();
-            match persona::ingest_videos(&data_root, &paths.raw, &person, &slug, &videos, &today) {
-                Ok(source_paths) => {
-                    let description = format!(
-                        "Build a persona wiki page for {person} from {} raw video transcript(s)",
-                        source_paths.len()
-                    );
-                    match handover::stage_persona_sources(
-                        &paths,
-                        &slug,
-                        source_paths,
-                        &description,
-                        &source,
-                    ) {
-                        Ok(job_id) => {
-                            println!("staged: {job_id}");
-                            ExitCode::SUCCESS
-                        }
-                        Err(e) => {
-                            eprintln!("trm ingest-persona failed: {e}");
-                            ExitCode::FAILURE
-                        }
+            let mut source_paths = Vec::new();
+
+            if !videos.is_empty() {
+                match persona::ingest_videos(
+                    &data_root, &paths.raw, &person, &slug, &videos, &today,
+                ) {
+                    Ok(mut paths) => source_paths.append(&mut paths),
+                    Err(e) => {
+                        eprintln!("trm ingest-persona failed (video source): {e}");
+                        return ExitCode::FAILURE;
                     }
                 }
-                Err(e) => {
-                    eprintln!("trm ingest-persona failed: {e}");
-                    ExitCode::FAILURE
+            }
+            if !wikipedia.is_empty() {
+                match persona::ingest_wikipedia_pages(
+                    &paths.raw, &person, &slug, &wikipedia, &today,
+                ) {
+                    Ok(mut paths) => source_paths.append(&mut paths),
+                    Err(e) => {
+                        eprintln!("trm ingest-persona failed (wikipedia source): {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            if let Some(repo_url) = &git_repo {
+                match persona::ingest_git_commits(
+                    &paths.raw,
+                    &person,
+                    &slug,
+                    repo_url,
+                    &git_author,
+                    &today,
+                ) {
+                    Ok(mut paths) => source_paths.append(&mut paths),
+                    Err(e) => {
+                        eprintln!("trm ingest-persona failed (git source): {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            {
+                let description = format!(
+                    "Build a persona wiki page for {person} from {} raw source(s)",
+                    source_paths.len()
+                );
+                match handover::stage_persona_sources(
+                    &paths,
+                    &slug,
+                    source_paths,
+                    &description,
+                    &source,
+                ) {
+                    Ok(job_id) => {
+                        println!("staged: {job_id}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("trm ingest-persona failed: {e}");
+                        ExitCode::FAILURE
+                    }
                 }
             }
         }
