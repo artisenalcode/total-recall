@@ -8,6 +8,7 @@ mod embeddings;
 mod handover;
 mod ingest;
 mod lock;
+mod persona;
 mod wiki;
 mod window;
 
@@ -68,7 +69,13 @@ enum Commands {
     },
     /// Commit a completed handover's result (called by the harness after
     /// a sub-agent finished the judgment work `trm` couldn't do itself).
-    CompleteHandover { job_id: String, result: String },
+    /// Omit `result` to read from stdin instead -- same reasoning as
+    /// `retain`/`stage`: a synthesized persona wiki page can run to tens
+    /// of KB, well past comfortable argv territory.
+    CompleteHandover {
+        job_id: String,
+        result: Option<String>,
+    },
     /// Serve live usage docs, so the skill stub never goes stale.
     Skill {
         #[command(subcommand)]
@@ -105,6 +112,25 @@ enum Commands {
     /// the cwd `trm` itself is invoked from -- `-p/--bank` still
     /// overrides both if given explicitly.
     IngestSession { path: PathBuf },
+    /// Fetch+clean YouTube auto-captions for a person's videos and stage
+    /// a PersonaBuild handover for a sub-agent to synthesize into a
+    /// persona wiki page. Mechanical only (fetch/clean/stage) -- trm
+    /// never calls an LLM itself, per ADR-0002; synthesis is the
+    /// sub-agent's job once `trm pending-show <job-id>` is read.
+    IngestPersona {
+        #[arg(long)]
+        person: String,
+        #[arg(long)]
+        slug: String,
+        /// Repeatable: "<video_id>|<title>", e.g. --video
+        /// "dQw4w9WgXcQ|A Real Talk Title". Hand-picked, not
+        /// full-channel-enumerated -- matches this store's existing
+        /// per-advisor ingestion convention.
+        #[arg(long = "video", required = true)]
+        videos: Vec<String>,
+        #[arg(long, default_value = "direct")]
+        source: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -268,6 +294,24 @@ from the SESSION's own cwd (parsed out of squishi's digest output), not
 whatever directory `trm ingest-session` itself is invoked from —
 `-p/--bank` still overrides both if given explicitly. Fails loudly if
 `squishi` isn't on PATH or the session has nothing to digest (empty).
+
+## Ingest a persona (build an advisor from YouTube)
+
+    trm ingest-persona --person "Full Name" --slug the-slug \
+        --video "abc123|A Real Video Title" --video "def456|Another Title"
+
+Fetches+cleans YouTube auto-captions for each `--video` (real `yt-dlp`
+subprocess), writes one raw transcript file per video into the resolved
+bank's raw tier (same frontmatter shape as
+`advisory/tools/ingest_youtube.py`, so existing wiki-reading tooling needs
+no changes), then stages a `PersonaBuild` handover — **never concept-
+split** (that's the wrong shape for this job; see `handover.rs`'s own
+doc comment on why, dated 2026-08-07). `trm pending-show <job-id>` prints
+the real, embedded synthesis criteria (co-developed with a real clinical-
+psychology advisor in this store) for the sub-agent completing the job.
+Mechanical only — trm never calls an LLM itself, per ADR-0002; synthesis
+happens when a sub-agent reads the pending prompt and writes the actual
+wiki page via `trm complete-handover`.
 
 ## Where facts live
 
@@ -446,6 +490,13 @@ fn main() -> ExitCode {
             }
         }
         Commands::CompleteHandover { job_id, result } => {
+            let result = match read_content_or_stdin(result) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("trm complete-handover failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             match complete_handover(&data_root, &cwd, cli.bank.as_deref(), &job_id, &result) {
                 Ok(()) => {
                     println!("completed: {job_id}");
@@ -539,6 +590,76 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Commands::IngestPersona {
+            person,
+            slug,
+            videos,
+            source,
+        } => {
+            let parsed: Result<Vec<persona::VideoTarget>, String> = videos
+                .iter()
+                .map(|v| match v.split_once('|') {
+                    Some((id, title)) => Ok(persona::VideoTarget {
+                        id: id.to_string(),
+                        title: title.to_string(),
+                    }),
+                    None => Err(format!(
+                        "invalid --video {v:?}, expected \"<video_id>|<title>\""
+                    )),
+                })
+                .collect();
+            let videos = match parsed {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("trm ingest-persona failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            let paths = bank::paths_for(&data_root, &bank_id);
+            if let Err(e) = fs::create_dir_all(&paths.root) {
+                eprintln!("trm ingest-persona failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            let _guard = match lock::acquire(&paths.root) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("trm ingest-persona failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let today = today_date();
+            match persona::ingest_videos(&paths.raw, &person, &slug, &videos, &today) {
+                Ok(source_paths) => {
+                    let description = format!(
+                        "Build a persona wiki page for {person} from {} raw video transcript(s)",
+                        source_paths.len()
+                    );
+                    match handover::stage_persona_sources(
+                        &paths,
+                        &slug,
+                        source_paths,
+                        &description,
+                        &source,
+                    ) {
+                        Ok(job_id) => {
+                            println!("staged: {job_id}");
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("trm ingest-persona failed: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("trm ingest-persona failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Commands::Skill { action } => match action {
             SkillAction::Get { topic } => match topic.as_str() {
                 "core" => {
@@ -626,6 +747,20 @@ fn find_md_files(dir: &std::path::Path) -> io::Result<Vec<PathBuf>> {
 
 /// Resolve the bank, acquire its lock, and stage raw content for a
 /// sub-agent handover. Returns the job id.
+/// `YYYY-MM-DD`, via the real system `date` command rather than a new
+/// dependency — this crate is Linux-only already (see `lock.rs`'s own
+/// doc comment), and every other external-fact need in this binary
+/// (yt-dlp, squishi) already goes through a real subprocess.
+fn today_date() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown-date".to_string())
+}
+
 fn stage(
     data_root: &std::path::Path,
     cwd: &std::path::Path,
@@ -809,6 +944,12 @@ mod tests {
     fn core_docs_covers_ingest_session() {
         assert!(CORE_DOCS.contains("trm ingest-session"));
         assert!(CORE_DOCS.contains("SESSION's own cwd"));
+    }
+
+    #[test]
+    fn core_docs_covers_ingest_persona() {
+        assert!(CORE_DOCS.contains("trm ingest-persona"));
+        assert!(CORE_DOCS.contains("PersonaBuild"));
     }
 
     #[test]

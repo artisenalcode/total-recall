@@ -124,6 +124,38 @@ fn stage_reads_from_stdin_when_no_argument_given() {
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("staged:"));
 }
 
+#[test]
+fn complete_handover_reads_from_stdin_when_no_argument_given() {
+    let data_root = scratch_data_root();
+    let stage_output = run_trm_with_stdin(
+        &["-p", "test-bank", "stage", "--reason", "a real reason"],
+        data_root.path(),
+        "raw content piped in over stdin for a handover",
+    );
+    let job_id = String::from_utf8_lossy(&stage_output.stdout)
+        .trim()
+        .strip_prefix("staged: ")
+        .expect("stage should print a job id")
+        .to_string();
+
+    // A result large enough that passing it as a positional argument
+    // would be exactly the fragile pattern retain/stage already moved
+    // away from -- the real motivation for this fix.
+    let large_result = format!("# A synthesized page\n\n{}", "real content ".repeat(2000));
+    let output = run_trm_with_stdin(
+        &["-p", "test-bank", "complete-handover", &job_id],
+        data_root.path(),
+        &large_result,
+    );
+
+    assert!(
+        output.status.success(),
+        "trm complete-handover exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("completed:"));
+}
+
 /// No positional argument AND stdin is a real pipe with nothing written
 /// to it (immediate EOF, not a terminal) — a real, legitimate "empty
 /// content" case, distinct from the terminal-refusal path (which this
