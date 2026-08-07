@@ -21,6 +21,19 @@ fn run_trm(args: &[&str], data_root: &std::path::Path) -> std::process::Output {
         .expect("failed to run trm binary")
 }
 
+fn run_trm_from_cwd(
+    args: &[&str],
+    data_root: &std::path::Path,
+    invocation_cwd: &std::path::Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_trm"))
+        .args(args)
+        .env("MF_DATA_ROOT", data_root)
+        .current_dir(invocation_cwd)
+        .output()
+        .expect("failed to run trm binary")
+}
+
 fn run_trm_with_stdin(
     args: &[&str],
     data_root: &std::path::Path,
@@ -125,4 +138,67 @@ fn retain_with_empty_piped_stdin_does_not_hang() {
     // exit (not hang waiting for more stdin) — that's the real contract
     // under test.
     assert!(output.status.code().is_some());
+}
+
+/// The one real behavioral requirement ported from session_to_trm.py:
+/// `ingest-session` must stage into the bank resolved from the
+/// SESSION's own cwd (parsed out of squishi's digest output), not
+/// whatever directory `trm` itself was invoked from. Sets up a fake
+/// "session repo" (dir A, with `.trm-bank` = a known marker) distinct
+/// from the real invocation cwd (dir B, no bank markers at all — would
+/// resolve to "global" if cwd resolution were used by mistake), and
+/// confirms the staged content lands in dir A's bank, not "global".
+#[test]
+fn ingest_session_stages_into_the_bank_resolved_from_the_session_s_own_cwd() {
+    let data_root = scratch_data_root();
+    let session_repo = tempfile::tempdir().expect("failed to create session repo dir");
+    let invocation_cwd = tempfile::tempdir().expect("failed to create invocation cwd dir");
+
+    std::fs::create_dir(session_repo.path().join(".git")).unwrap();
+    std::fs::write(
+        session_repo.path().join(".trm-bank"),
+        "session-bank-marker\n",
+    )
+    .unwrap();
+
+    let session_cwd_json = serde_json::to_string(session_repo.path().to_str().unwrap()).unwrap();
+    let user_line = format!(
+        r#"{{"type":"user","sessionId":"sess-cross-cwd","cwd":{session_cwd_json},"timestamp":"t1","message":{{"role":"user","content":[{{"type":"text","text":"a real question about the project"}}]}}}}"#
+    );
+    let assistant_line = format!(
+        r#"{{"type":"assistant","sessionId":"sess-cross-cwd","cwd":{session_cwd_json},"timestamp":"t2","message":{{"role":"assistant","content":[{{"type":"text","text":"a real answer with enough content to be worth staging"}}]}}}}"#
+    );
+    let transcript = format!("{user_line}\n{assistant_line}\n");
+    let transcript_path = data_root.path().join("fixture-session.jsonl");
+    std::fs::write(&transcript_path, transcript).unwrap();
+
+    let output = run_trm_from_cwd(
+        &["ingest-session", transcript_path.to_str().unwrap()],
+        data_root.path(),
+        invocation_cwd.path(),
+    );
+
+    assert!(
+        output.status.success(),
+        "trm ingest-session exited non-zero: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("staged:"));
+
+    // Confirm it landed in the SESSION's bank, not "global" (which is
+    // what invocation_cwd, having no bank markers, would resolve to).
+    let recall = run_trm(&["-p", "session-bank-marker", "pending"], data_root.path());
+    let recall_stdout = String::from_utf8_lossy(&recall.stdout);
+    assert!(
+        !recall_stdout.trim().is_empty() && !recall_stdout.contains("no pending"),
+        "expected a pending handover in session-bank-marker, got: {recall_stdout}"
+    );
+
+    let global_pending = run_trm(&["-p", "global", "pending"], data_root.path());
+    let global_stdout = String::from_utf8_lossy(&global_pending.stdout);
+    assert!(
+        global_stdout.trim().is_empty() || global_stdout.to_lowercase().contains("no pending"),
+        "the global bank should NOT have received this session's content, got: {global_stdout}"
+    );
 }

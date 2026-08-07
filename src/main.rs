@@ -6,6 +6,7 @@ mod doctor;
 mod embed_cache;
 mod embeddings;
 mod handover;
+mod ingest;
 mod lock;
 mod wiki;
 mod window;
@@ -97,6 +98,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Extract + compress a Claude Code session transcript (via the real
+    /// `squishi --session-digest`) and stage the result for handover.
+    /// Rust port of `session_to_trm.py`. Stages into the bank resolved
+    /// from the SESSION's own cwd (parsed from squishi's output), not
+    /// the cwd `trm` itself is invoked from -- `-p/--bank` still
+    /// overrides both if given explicitly.
+    IngestSession { path: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -248,6 +256,19 @@ up; warnings don't fail the run. `--fix` is the only thing this command
 ever mutates, and only reclaims a lock already confirmed stale (dead
 pid) — never a live one.
 
+## Ingest a Claude Code session
+
+    trm ingest-session <transcript.jsonl>
+
+Rust port of `session_to_trm.py` — extraction+compression now live in
+squishi (`squishi --session-digest`, which this shells out to);
+`ingest-session` owns the actual `stage` call, keeping squishi's own
+"never stores/retrieves" boundary intact. Stages into the bank resolved
+from the SESSION's own cwd (parsed out of squishi's digest output), not
+whatever directory `trm ingest-session` itself is invoked from —
+`-p/--bank` still overrides both if given explicitly. Fails loudly if
+`squishi` isn't on PATH or the session has nothing to digest (empty).
+
 ## Where facts live
 
 ~/.trm/banks/<bank-id>/wiki/<slug>.md — one file per fact, plain
@@ -257,13 +278,14 @@ but not yet processed (empty until ingestion pathways exist).
 
 ## What trm does not do (yet)
 
+Claude Code session ingestion is real now (`trm ingest-session`, above).
 No ingestion pathways for repo scan, YouTube, or web scrape (`code
 archaeology`/`youtube`/`web-scrape` per CONTEXT.md's resolved-but-unbuilt
-pathway list). `docs/chat-exports/`-style bulk sources have the mechanism
-(stage + concept pre-split) but no dedicated ingestion script wired to it
-yet. Kimi Code session ingestion is explicitly deferred (Claude Code
-proven first, per the user's own sequencing call) — real Kimi session data
-exists on disk, nothing reads it into trm yet.
+pathway list) — still true. `docs/chat-exports/`-style bulk sources have
+the mechanism (stage + concept pre-split) but no dedicated ingestion
+script wired to it yet. Kimi Code session ingestion is explicitly
+deferred (Claude Code proven first, per the user's own sequencing call)
+— real Kimi session data exists on disk, nothing reads it into trm yet.
 "#;
 
 /// Resolve content from the positional argument if given, otherwise
@@ -477,6 +499,46 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        Commands::IngestSession { path } => match ingest::run_squishi_session_digest(&path) {
+            Ok(digest) if digest.content.trim().is_empty() => {
+                eprintln!("trm ingest-session failed: nothing to digest (empty session)");
+                ExitCode::FAILURE
+            }
+            Ok(digest) => {
+                let reason = ingest::build_reason(&digest);
+                // The session's OWN cwd (parsed from squishi's output),
+                // not the invoking process's cwd -- the one real
+                // behavior ported exactly from session_to_trm.py, so
+                // bank resolution matches what running `trm` from
+                // inside the session's own project would have done.
+                let session_cwd = digest
+                    .cwd
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| cwd.clone());
+                match stage(
+                    &data_root,
+                    &session_cwd,
+                    cli.bank.as_deref(),
+                    &digest.content,
+                    &reason,
+                    "direct",
+                ) {
+                    Ok(job_id) => {
+                        println!("staged: {job_id}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("trm ingest-session failed: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("trm ingest-session failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Commands::Skill { action } => match action {
             SkillAction::Get { topic } => match topic.as_str() {
                 "core" => {
@@ -741,6 +803,12 @@ mod tests {
     #[test]
     fn core_docs_covers_recall() {
         assert!(CORE_DOCS.contains("trm recall"));
+    }
+
+    #[test]
+    fn core_docs_covers_ingest_session() {
+        assert!(CORE_DOCS.contains("trm ingest-session"));
+        assert!(CORE_DOCS.contains("SESSION's own cwd"));
     }
 
     #[test]
