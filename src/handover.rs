@@ -19,6 +19,14 @@ pub enum HandoverKind {
     Extraction,
     /// Two or more wiki entries look related; judge whether to merge/retire.
     Curation,
+    /// Raw source transcripts for a person need synthesizing into one
+    /// persona wiki page. Deliberately NOT concept-split — per-sentence
+    /// splitting is the wrong shape for this job (it's exactly the
+    /// candidate-explosion problem measured 2026-08-07: one real
+    /// transcript produced 421 sentence-level candidates). A persona
+    /// build needs the whole source read together for one holistic
+    /// authoring task, not judged sentence-by-sentence.
+    PersonaBuild,
 }
 
 /// A single unit of work trm cannot do itself. Milestone 1 defines the
@@ -117,6 +125,11 @@ impl HandoverTask {
             ),
             None => String::new(),
         };
+        let persona_instructions = if self.kind == HandoverKind::PersonaBuild {
+            PERSONA_BUILD_CRITERIA
+        } else {
+            ""
+        };
         let candidates = if self.candidate_concepts.is_empty() {
             String::new()
         } else {
@@ -137,7 +150,7 @@ impl HandoverTask {
             )
         };
         format!(
-            "{:?} handover: {}\nsource: {}\nsources:\n{}{warning}{split_note}{candidates}",
+            "{:?} handover: {}\nsource: {}\nsources:\n{}{warning}{split_note}{candidates}{persona_instructions}",
             self.kind,
             self.description,
             self.source,
@@ -149,6 +162,33 @@ impl HandoverTask {
         )
     }
 }
+
+/// The real capture criteria co-developed with Dr. Roy Sugarman
+/// (2026-08-07, see advisory/knowledge/wiki/roy-sugarman.md and the
+/// jordan-peterson.md file built with them) — embedded here so a
+/// sub-agent picking up a PersonaBuild handover has the actual
+/// instructions in hand, not a pointer to go re-derive them.
+const PERSONA_BUILD_CRITERIA: &str = "\n\n\
+PERSONA BUILD — synthesize the source transcripts above into one persona wiki page. \
+Read all sources together before writing; this is one holistic authoring task, not a \
+per-sentence judgment (deliberately not concept-split — see HandoverKind::PersonaBuild).\n\n\
+Capture criteria (co-developed with Dr. Roy Sugarman, a real clinical neuropsychologist \
+advisor in this store):\n\
+1. Process/mechanism, not trait labels — how they think, not a score.\n\
+2. Values, ranked, evidenced by what they return to unprompted across independent sources.\n\
+3. A real personally-supplied relational layer ONLY if the requester actually knows this \
+person — never fabricate one. If no personal relationship exists, mark `personal: false` \
+(or omit) and say so explicitly in the file.\n\
+4. An explicit, permanent caveat that text cannot carry warmth/relational field.\n\
+5. Recurring stories as the actual retrieval unit, paired with the concept each illustrates.\n\
+6. Provenance/confidence tagged per claim — FOUR buckets, not three: corpus-evidenced / \
+user-supplied / inferred / externally disputed (a claim can be sincerely held and \
+corpus-evidenced and still be actively contested by domain experts — tag that separately).\n\
+7. An explicit scope boundary — what they're actually credentialed/practiced in vs. what \
+they merely commented on once, AND distinguish self-disclosed limitations from claims \
+inside their stated expertise that others have actually disputed.\n\n\
+When done: write the wiki page to the resolved bank's wiki tier (same format as every other \
+entry in this store — frontmatter + sections), then `trm complete-handover <job-id> \"<summary>\"`.";
 
 /// Stage raw content for extraction: write it into the raw tier, then
 /// drop a pending marker (the rendered prompt) so `list_pending` and a
@@ -191,6 +231,29 @@ pub fn stage(
     }
     atomic::write(&paths.pending.join(format!("{slug}.md")), &task.as_prompt())?;
     Ok(slug)
+}
+
+/// Stage a set of already-written raw source transcripts as one
+/// `PersonaBuild` handover — deliberately never concept-split (see
+/// `HandoverKind::PersonaBuild`'s doc comment for why). The job id is
+/// derived from `slug` directly, not `wiki::slugify`'d from content,
+/// since there's no single content blob here — the caller (persona
+/// ingestion) already knows the person's slug.
+pub fn stage_persona_sources(
+    paths: &bank::BankPaths,
+    slug: &str,
+    source_paths: Vec<PathBuf>,
+    description: &str,
+    source: &str,
+) -> io::Result<String> {
+    let task = HandoverTask::new(
+        HandoverKind::PersonaBuild,
+        description,
+        source_paths,
+        source,
+    );
+    atomic::write(&paths.pending.join(format!("{slug}.md")), &task.as_prompt())?;
+    Ok(slug.to_string())
 }
 
 /// Isolated so a model-load/split failure is a plain `Err(reason)` the
@@ -368,6 +431,36 @@ mod tests {
         );
         let marker = fs::read_to_string(paths.pending.join(format!("{job_id}.md"))).unwrap();
         assert!(marker.contains("extract facts from this"));
+    }
+
+    #[test]
+    fn stage_persona_sources_never_concept_splits_and_embeds_the_real_criteria() {
+        let (_data_root, paths) = test_paths();
+        let source_paths = vec![
+            paths.raw.join("jane-doe/yt-abc123.md"),
+            paths.raw.join("jane-doe/yt-def456.md"),
+        ];
+        let job_id = stage_persona_sources(
+            &paths,
+            "jane-doe",
+            source_paths.clone(),
+            "Build a persona wiki page for Jane Doe from 2 raw video transcript(s)",
+            "direct",
+        )
+        .unwrap();
+
+        assert_eq!(job_id, "jane-doe");
+        let marker = fs::read_to_string(paths.pending.join("jane-doe.md")).unwrap();
+        assert!(marker.starts_with("PersonaBuild handover:"));
+        assert!(marker.contains("yt-abc123.md"));
+        assert!(marker.contains("yt-def456.md"));
+        // Never concept-split -- the whole point of this job kind.
+        assert!(!marker.contains("candidate concept(s)"));
+        // The real, embedded criteria (co-developed with Roy) must be
+        // present so a sub-agent has the actual instructions, not a
+        // pointer to go re-derive them.
+        assert!(marker.contains("Values, ranked, evidenced by what they return to unprompted"));
+        assert!(marker.contains("externally disputed"));
     }
 
     /// Per ADR-0004: bulk/multi-concept content staged for a handover
