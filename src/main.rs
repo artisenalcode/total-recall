@@ -301,8 +301,12 @@ whatever directory `trm ingest-session` itself is invoked from —
         --video "abc123|A Real Video Title" --video "def456|Another Title"
 
 Fetches+cleans YouTube auto-captions for each `--video` (real `yt-dlp`
-subprocess), writes one raw transcript file per video into the resolved
-bank's raw tier (same frontmatter shape as
+subprocess). If `yt-dlp` isn't on PATH, a standalone binary is
+downloaded once (real HTTP GET via `ureq`, no async runtime, no GPL
+code linked into this binary -- the downloaded executable is the same
+external tool either way) and cached at `<data_root>/bin/yt-dlp` for
+every future call. Writes one raw transcript file per video into the
+resolved bank's raw tier (same frontmatter shape as
 `advisory/tools/ingest_youtube.py`, so existing wiki-reading tooling needs
 no changes), then stages a `PersonaBuild` handover — **never concept-
 split** (that's the wrong shape for this job; see `handover.rs`'s own
@@ -631,7 +635,7 @@ fn main() -> ExitCode {
             };
 
             let today = today_date();
-            match persona::ingest_videos(&paths.raw, &person, &slug, &videos, &today) {
+            match persona::ingest_videos(&data_root, &paths.raw, &person, &slug, &videos, &today) {
                 Ok(source_paths) => {
                     let description = format!(
                         "Build a persona wiki page for {person} from {} raw video transcript(s)",
@@ -950,6 +954,7 @@ mod tests {
     fn core_docs_covers_ingest_persona() {
         assert!(CORE_DOCS.contains("trm ingest-persona"));
         assert!(CORE_DOCS.contains("PersonaBuild"));
+        assert!(CORE_DOCS.contains("bin/yt-dlp"));
     }
 
     #[test]
