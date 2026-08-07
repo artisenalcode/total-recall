@@ -2545,6 +2545,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fastembed",
+ "serde_json",
  "tempfile",
 ]
 
