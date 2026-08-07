@@ -9,6 +9,7 @@
 //! `/advice`) needs no changes to read the resulting raw files.
 
 use crate::atomic;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -272,6 +273,7 @@ pub fn ingest_wikipedia_pages(
     std::fs::create_dir_all(&person_dir).map_err(|e| e.to_string())?;
 
     let mut written = Vec::with_capacity(titles.len());
+    let mut dedup_items = Vec::with_capacity(titles.len());
     for title in titles {
         let text = fetch_wikipedia(title)?;
         let md = build_wikipedia_raw_md(person, slug, title, &text, ingested_date);
@@ -279,9 +281,12 @@ pub fn ingest_wikipedia_pages(
         let file_path = person_dir.join(&file_name);
         atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
         written.push(file_path);
+        dedup_items.push((slugify(title), text));
+    }
 
-        if let Ok(dedup_json) = run_squishi_dedup(&text) {
-            let sidecar_path = person_dir.join(format!("wikipedia-{}.dedup.json", slugify(title)));
+    if let Ok(results) = run_squishi_dedup_batch(&dedup_items) {
+        for (id, dedup_json) in results {
+            let sidecar_path = person_dir.join(format!("wikipedia-{id}.dedup.json"));
             let _ = atomic::write(&sidecar_path, &dedup_json);
         }
     }
@@ -490,9 +495,12 @@ pub fn ingest_git_commits(
     let file_path = person_dir.join(&file_name);
     atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
 
-    if let Ok(dedup_json) = run_squishi_dedup(&text) {
-        let sidecar_path = person_dir.join(format!("git-{}.dedup.json", slugify(repo_name)));
-        let _ = atomic::write(&sidecar_path, &dedup_json);
+    let dedup_items = vec![(slugify(repo_name), text)];
+    if let Ok(results) = run_squishi_dedup_batch(&dedup_items) {
+        for (id, dedup_json) in results {
+            let sidecar_path = person_dir.join(format!("git-{id}.dedup.json"));
+            let _ = atomic::write(&sidecar_path, &dedup_json);
+        }
     }
 
     Ok(vec![file_path])
@@ -583,23 +591,36 @@ pub fn fetch_captions(
     Ok(cleaned)
 }
 
-/// Runs squishi's caller-asserted plain-text dedup on cleaned transcript
-/// text and returns its raw `--json` output verbatim — an opaque
-/// passthrough, matching squishi's own stated boundary ("compresses
-/// text, never stores/retrieves"): this module's job is calling it and
-/// persisting what it returns as a traceability sidecar, not
-/// interpreting the content itself (that's a synthesis sub-agent's job).
-/// `--force-kind plain-text` is the caller assertion this exists for —
-/// squishi's own shape-detection heuristic false-positives on real
-/// conversational transcripts (ordinary words like "failed" trip its
-/// Log-shape regex with zero structural check), found and fixed
-/// 2026-08-07 by testing this exact pipeline against real Dr. Roy
-/// Sugarman transcripts.
-fn run_squishi_dedup(text: &str) -> Result<String, String> {
+/// Runs squishi's caller-asserted plain-text dedup on a whole batch of
+/// `(id, text)` pairs in ONE squishi process via `--batch`, instead of
+/// one process per item. Real fix for a real bottleneck (found
+/// 2026-08-08 reingesting 19 real persona videos one-subprocess-per-
+/// video): each call reloaded the ~562MB punctuation-restoration model
+/// from scratch, turning a batch job into hours of redundant model
+/// loading. `--batch` loads the model once, reuses it across every
+/// item in the array. Returns each item's own JSON result (same shape
+/// a single-item call would have produced, still one document per id)
+/// so callers keep writing one `.dedup.json` sidecar per source,
+/// unchanged. Best-effort at the *batch* level — matching the prior
+/// per-item best-effort posture, squishi being unavailable means no
+/// sidecars for this whole batch, not a partial one.
+fn run_squishi_dedup_batch(items: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
     use std::io::Write;
 
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let input = Value::Array(
+        items
+            .iter()
+            .map(|(id, text)| serde_json::json!({ "id": id, "text": text }))
+            .collect(),
+    );
+    let input_str = serde_json::to_string(&input).map_err(|e| e.to_string())?;
+
     let mut child = Command::new("squishi")
-        .args(["--force-kind", "plain-text", "--json"])
+        .args(["--batch", "--force-kind", "plain-text"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -610,17 +631,35 @@ fn run_squishi_dedup(text: &str) -> Result<String, String> {
         .stdin
         .take()
         .ok_or_else(|| "squishi: no stdin handle".to_string())?
-        .write_all(text.as_bytes())
+        .write_all(input_str.as_bytes())
         .map_err(|e| e.to_string())?;
 
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(format!(
-            "squishi failed: {}",
+            "squishi --batch failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+
+    let stdout = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    let results: Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+    let array = results
+        .as_array()
+        .ok_or_else(|| "squishi --batch: expected a JSON array".to_string())?;
+
+    array
+        .iter()
+        .map(|item| {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "squishi --batch: result item missing id".to_string())?
+                .to_string();
+            let json = serde_json::to_string(item).map_err(|e| e.to_string())?;
+            Ok((id, json))
+        })
+        .collect()
 }
 
 /// Fetch+clean+write raw transcript files for every video, into
@@ -654,6 +693,7 @@ pub fn ingest_videos(
     std::fs::create_dir_all(&person_dir).map_err(|e| e.to_string())?;
 
     let mut written = Vec::with_capacity(videos.len());
+    let mut dedup_items = Vec::with_capacity(videos.len());
     for video in videos {
         let text = fetch_captions(&yt_dlp_bin, &video.id, &person_dir)?;
         let md = build_raw_transcript_md(person, slug, video, &text, ingested_date);
@@ -661,9 +701,12 @@ pub fn ingest_videos(
         let file_path = person_dir.join(&file_name);
         atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
         written.push(file_path);
+        dedup_items.push((video.id.clone(), text));
+    }
 
-        if let Ok(dedup_json) = run_squishi_dedup(&text) {
-            let sidecar_path = person_dir.join(format!("yt-{}.dedup.json", video.id));
+    if let Ok(results) = run_squishi_dedup_batch(&dedup_items) {
+        for (id, dedup_json) in results {
+            let sidecar_path = person_dir.join(format!("yt-{id}.dedup.json"));
             let _ = atomic::write(&sidecar_path, &dedup_json);
         }
     }
@@ -951,7 +994,7 @@ mod tests {
 
     #[test]
     #[ignore] // requires `squishi` installed on PATH (real subprocess, first-run model download)
-    fn run_squishi_dedup_returns_the_real_json_contract_for_plain_prose() {
+    fn run_squishi_dedup_batch_returns_the_real_json_contract_per_item() {
         // Real content, over squishi's SKIP_SEMANTIC_DEDUP_UNDER_CHARS
         // (2000 chars) so this actually exercises the ONNX dedup path,
         // not just the short-input line-dedup passthrough.
@@ -960,15 +1003,31 @@ mod tests {
                          the load-bearing unit of motivation and autonomy matters more than \
                          almost anything else in coaching. ";
         let text: String = std::iter::repeat_n(sentence, 20).collect();
-        let result = run_squishi_dedup(&text);
+        let items = vec![
+            ("first".to_string(), text.clone()),
+            ("second".to_string(), text),
+        ];
+        let result = run_squishi_dedup_batch(&items);
         assert!(
             result.is_ok(),
             "squishi not on PATH or failed: {:?}",
             result.err()
         );
-        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        let results = result.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "first");
+        assert_eq!(results[1].0, "second");
+        let json: serde_json::Value = serde_json::from_str(&results[0].1).unwrap();
         assert_eq!(json["kind"], "PlainText");
         assert!(json.get("stories").is_some());
         assert!(json.get("drops").is_some());
+    }
+
+    #[test]
+    fn run_squishi_dedup_batch_on_empty_input_returns_empty_without_spawning() {
+        // Never touches the network/subprocess for an empty batch --
+        // real, fast, no #[ignore] needed.
+        let result = run_squishi_dedup_batch(&[]);
+        assert_eq!(result, Ok(Vec::new()));
     }
 }
