@@ -268,6 +268,46 @@ pub fn fetch_captions(
     Ok(cleaned)
 }
 
+/// Runs squishi's caller-asserted plain-text dedup on cleaned transcript
+/// text and returns its raw `--json` output verbatim — an opaque
+/// passthrough, matching squishi's own stated boundary ("compresses
+/// text, never stores/retrieves"): this module's job is calling it and
+/// persisting what it returns as a traceability sidecar, not
+/// interpreting the content itself (that's a synthesis sub-agent's job).
+/// `--force-kind plain-text` is the caller assertion this exists for —
+/// squishi's own shape-detection heuristic false-positives on real
+/// conversational transcripts (ordinary words like "failed" trip its
+/// Log-shape regex with zero structural check), found and fixed
+/// 2026-08-07 by testing this exact pipeline against real Dr. Roy
+/// Sugarman transcripts.
+fn run_squishi_dedup(text: &str) -> Result<String, String> {
+    use std::io::Write;
+
+    let mut child = Command::new("squishi")
+        .args(["--force-kind", "plain-text", "--json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn squishi: {e}"))?;
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "squishi: no stdin handle".to_string())?
+        .write_all(text.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "squishi failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+}
+
 /// Fetch+clean+write raw transcript files for every video, into
 /// `<bank>/raw/<slug>/` (the same tier `stage()` uses for pending
 /// content — consistent with this being raw material awaiting a
@@ -276,6 +316,15 @@ pub fn fetch_captions(
 /// `handover::stage_persona_sources`. Resolves (and caches, if needed)
 /// the `yt-dlp` binary once for the whole batch via `ensure_yt_dlp`,
 /// not once per video.
+///
+/// Also writes a `yt-<id>.dedup.json` sidecar per video — squishi's
+/// dedup/shape/summary output, run best-effort: squishi being
+/// unavailable (not installed, not on PATH) never fails the whole
+/// ingestion, it just means no sidecar for that run. The sub-agent
+/// completing the handover reads the sidecar when present as a
+/// traceable pointer into the raw transcript (which sentences are
+/// narrative-shaped, which are the most central/summary-worthy) rather
+/// than reading the full raw transcript cold every time.
 pub fn ingest_videos(
     data_root: &Path,
     raw_dir: &Path,
@@ -297,6 +346,11 @@ pub fn ingest_videos(
         let file_path = person_dir.join(&file_name);
         atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
         written.push(file_path);
+
+        if let Ok(dedup_json) = run_squishi_dedup(&text) {
+            let sidecar_path = person_dir.join(format!("yt-{}.dedup.json", video.id));
+            let _ = atomic::write(&sidecar_path, &dedup_json);
+        }
     }
     Ok(written)
 }
@@ -428,5 +482,28 @@ mod tests {
             "2026-08-07",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore] // requires `squishi` installed on PATH (real subprocess, first-run model download)
+    fn run_squishi_dedup_returns_the_real_json_contract_for_plain_prose() {
+        // Real content, over squishi's SKIP_SEMANTIC_DEDUP_UNDER_CHARS
+        // (2000 chars) so this actually exercises the ONNX dedup path,
+        // not just the short-input line-dedup passthrough.
+        let sentence = "I had a client who wanted to lose weight to fit into a wedding dress, \
+                         and context tells the genes what they need to do, because values are \
+                         the load-bearing unit of motivation and autonomy matters more than \
+                         almost anything else in coaching. ";
+        let text: String = std::iter::repeat_n(sentence, 20).collect();
+        let result = run_squishi_dedup(&text);
+        assert!(
+            result.is_ok(),
+            "squishi not on PATH or failed: {:?}",
+            result.err()
+        );
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(json["kind"], "PlainText");
+        assert!(json.get("stories").is_some());
+        assert!(json.get("drops").is_some());
     }
 }
