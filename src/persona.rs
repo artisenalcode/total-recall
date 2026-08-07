@@ -112,11 +112,33 @@ pub fn build_raw_transcript_md(
     )
 }
 
+/// Pick the largest file among candidate caption-track variants — real,
+/// robust signal (a fuller transcript is always bigger), unlike
+/// filename ordering (see `fetch_captions`'s doc comment for the real
+/// bug this replaced). Pure and directly testable against real files
+/// on disk, no network required.
+fn select_largest(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths
+        .iter()
+        .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .cloned()
+}
+
 /// Spawn `yt-dlp` to fetch a video's English auto-captions (VTT), read
-/// and clean the result, then remove the temp file. Real subprocess I/O
-/// — not unit-tested directly (mocking a network-capable subprocess
+/// and clean the result, then remove the temp file(s). Real subprocess
+/// I/O — not unit-tested directly (mocking a network-capable subprocess
 /// buys nothing real); same discipline as `session_prune`'s and
 /// `ingest`'s own real-subprocess boundaries.
+///
+/// Real finding (2026-08-07, live smoke test): `--sub-lang "en.*"`
+/// legitimately makes yt-dlp write more than one matching `.vtt` file
+/// for a single video when multiple English caption tracks exist (seen
+/// live: `en-en.vtt`, `en-orig.vtt`, `en.vtt` for the same video) —
+/// picking the alphabetically-first one is wrong: it picked the sparse
+/// `en-en` variant (2,062 words) over the real, full transcript
+/// (9,044 words) sitting right next to it. Byte size is the real,
+/// robust signal — the fuller transcript is always larger — not
+/// filename ordering.
 pub fn fetch_captions(video_id: &str, work_dir: &Path) -> Result<String, String> {
     let stem = work_dir.join(video_id);
     let output = Command::new("yt-dlp")
@@ -142,7 +164,7 @@ pub fn fetch_captions(video_id: &str, work_dir: &Path) -> Result<String, String>
         ));
     }
 
-    let mut vtt_paths: Vec<PathBuf> = std::fs::read_dir(work_dir)
+    let vtt_paths: Vec<PathBuf> = std::fs::read_dir(work_dir)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -152,14 +174,17 @@ pub fn fetch_captions(video_id: &str, work_dir: &Path) -> Result<String, String>
                 .is_some_and(|n| n.starts_with(video_id) && n.ends_with(".vtt"))
         })
         .collect();
-    vtt_paths.sort();
 
-    let vtt_path = vtt_paths
-        .into_iter()
-        .next()
+    let largest = select_largest(&vtt_paths)
         .ok_or_else(|| format!("no captions available for {video_id}"))?;
-    let raw = std::fs::read_to_string(&vtt_path).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&vtt_path);
+
+    let raw = std::fs::read_to_string(&largest).map_err(|e| e.to_string())?;
+    // Clean up every matching variant, not just the one read — an
+    // unselected sibling track left on disk is real orphaned trash
+    // otherwise (found in the same live smoke test).
+    for path in &vtt_paths {
+        let _ = std::fs::remove_file(path);
+    }
 
     let cleaned = clean_vtt(&raw);
     if cleaned.len() < 200 {
@@ -248,6 +273,43 @@ mod tests {
         assert!(md.contains("type: youtube-transcript\n"));
         assert!(md.contains("word_count: 3\n"));
         assert!(md.contains("# A Real Talk\n\nreal body text\n"));
+    }
+
+    /// Real regression test for the bug found in the 2026-08-07 live
+    /// smoke test: yt-dlp legitimately wrote three matching caption-
+    /// track files for one real video (`en-en.vtt` sparse, `en-orig.vtt`
+    /// and `en.vtt` full) -- alphabetical-first selection picked the
+    /// sparse one (2,062 words instead of 9,044). Real files on disk,
+    /// real sizes, no mocking.
+    #[test]
+    fn select_largest_picks_the_fuller_transcript_not_the_alphabetically_first_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sparse = tmp.path().join("abc123.en-en.vtt");
+        let full_a = tmp.path().join("abc123.en-orig.vtt");
+        let full_b = tmp.path().join("abc123.en.vtt");
+        std::fs::write(&sparse, "short").unwrap();
+        std::fs::write(&full_a, "a real, much fuller transcript body here").unwrap();
+        std::fs::write(&full_b, "another real, much fuller transcript body").unwrap();
+
+        // "abc123.en-en.vtt" sorts alphabetically first -- confirming
+        // the real ordering that produced the original bug.
+        let mut sorted = [sparse.clone(), full_a.clone(), full_b.clone()];
+        sorted.sort();
+        assert_eq!(
+            sorted[0], sparse,
+            "sanity check: sparse file does sort first"
+        );
+
+        let picked = select_largest(&[sparse, full_a.clone(), full_b]).unwrap();
+        assert!(
+            picked == full_a || std::fs::metadata(&picked).unwrap().len() > 5,
+            "must pick a fuller file, not the sparse alphabetically-first one"
+        );
+    }
+
+    #[test]
+    fn select_largest_on_no_candidates_returns_none() {
+        assert!(select_largest(&[]).is_none());
     }
 
     #[test]
