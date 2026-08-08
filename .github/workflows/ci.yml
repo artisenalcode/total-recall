@@ -23,10 +23,28 @@ jobs:
           path: ~/.trm/models
           key: ${{ runner.os }}-total-recall-embedding-model-v2
       # ingest_session_stages_into_the_bank_resolved_from_the_session_s_own_cwd
-      # (tests/cli.rs) needs the real `squishi` binary on PATH and skips itself
-      # here since it isn't -- squishi lives in a sibling private repo with no
-      # cross-repo checkout wired up (would need a PAT secret, not configured).
-      # If that's added later, install squishi in a step above this one and
-      # the test starts exercising the real path automatically, no code change.
+      # (tests/cli.rs) needs the real `squishi` binary on PATH -- it's a
+      # sibling private repo, so a same-scoped fine-grained PAT
+      # (SQUISHI_CHECKOUT_PAT, contents:read on artisenalcode/squishi only)
+      # checks it out here. Test skips itself gracefully if this secret isn't
+      # set, so a fork/PR from someone without it still gets a green build,
+      # just without this one test's real coverage.
+      - name: Checkout squishi
+        if: ${{ secrets.SQUISHI_CHECKOUT_PAT != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: artisenalcode/squishi
+          token: ${{ secrets.SQUISHI_CHECKOUT_PAT }}
+          path: squishi-checkout
+      - name: Cache squishi build
+        if: ${{ secrets.SQUISHI_CHECKOUT_PAT != '' }}
+        id: squishi-bin-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/squishi
+          key: ${{ runner.os }}-squishi-bin-${{ hashFiles('squishi-checkout/Cargo.lock') }}
+      - name: Build and install squishi
+        if: ${{ secrets.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
+        run: cargo install --path squishi-checkout --locked
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
