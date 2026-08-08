@@ -293,6 +293,23 @@ pub fn ingest_wikipedia_pages(
     Ok(written)
 }
 
+/// Strips a raw file's YAML frontmatter (`---\n...\n---\n`), returning
+/// just the body — shared by the resumability path in `ingest_videos`
+/// and by `dedup_raw_files`, both of which need the same plain-text
+/// content squishi actually dedupes, not the frontmatter around it.
+/// Falls back to the whole content unchanged if it doesn't look like it
+/// has frontmatter (defensive, not expected in practice — every raw
+/// file this crate writes has one).
+fn strip_frontmatter(content: &str) -> String {
+    match content.split_once("---\n") {
+        Some((_, rest)) => match rest.split_once("---\n") {
+            Some((_, body)) => body.trim().to_string(),
+            None => content.to_string(),
+        },
+        None => content.to_string(),
+    }
+}
+
 /// Filesystem-safe stand-in for a title with spaces/punctuation — same
 /// job `ingest_youtube.py`'s own `slugify` does, kept minimal (no crate)
 /// since it's one regex-shaped substitution.
@@ -671,14 +688,29 @@ fn run_squishi_dedup_batch(items: &[(String, String)]) -> Result<Vec<(String, St
 /// the `yt-dlp` binary once for the whole batch via `ensure_yt_dlp`,
 /// not once per video.
 ///
-/// Also writes a `yt-<id>.dedup.json` sidecar per video — squishi's
-/// dedup/shape/summary output, run best-effort: squishi being
-/// unavailable (not installed, not on PATH) never fails the whole
-/// ingestion, it just means no sidecar for that run. The sub-agent
-/// completing the handover reads the sidecar when present as a
-/// traceable pointer into the raw transcript (which sentences are
+/// Resilient per-video: one video's fetch failing (a transient network
+/// blip, a rate limit) does NOT abort the rest — it's logged into the
+/// returned failure list and the loop continues. Real cost of the
+/// opposite (found 2026-08-08): a 55-video job that fetched 54
+/// successfully over ~2 hours failed the WHOLE run — zero sidecars,
+/// nothing staged — because video 55 hit a rate limit and the old
+/// fail-fast `?` discarded everything already done. Only returns `Err`
+/// outright when literally every video failed (nothing to work with at
+/// all).
+///
+/// Also writes a `yt-<id>.dedup.json` sidecar per successfully-fetched
+/// video — squishi's dedup/shape/summary output, run best-effort:
+/// squishi being unavailable (not installed, not on PATH) never fails
+/// the whole ingestion, it just means no sidecars for this run (they
+/// can be produced later via `dedup_raw_files`, without re-fetching).
+/// The sub-agent completing the handover reads a sidecar when present
+/// as a traceable pointer into the raw transcript (which sentences are
 /// narrative-shaped, which are the most central/summary-worthy) rather
 /// than reading the full raw transcript cold every time.
+/// `(id, error message)` pairs for videos that failed to fetch —
+/// resilience means these are reported, not silently dropped or fatal.
+pub type FetchFailures = Vec<(String, String)>;
+
 pub fn ingest_videos(
     data_root: &Path,
     raw_dir: &Path,
@@ -686,7 +718,7 @@ pub fn ingest_videos(
     slug: &str,
     videos: &[VideoTarget],
     ingested_date: &str,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<(Vec<PathBuf>, FetchFailures), String> {
     let yt_dlp_bin = ensure_yt_dlp(data_root)?;
 
     let person_dir = raw_dir.join(slug);
@@ -694,14 +726,51 @@ pub fn ingest_videos(
 
     let mut written = Vec::with_capacity(videos.len());
     let mut dedup_items = Vec::with_capacity(videos.len());
+    let mut failures: FetchFailures = Vec::new();
     for video in videos {
-        let text = fetch_captions(&yt_dlp_bin, &video.id, &person_dir)?;
-        let md = build_raw_transcript_md(person, slug, video, &text, ingested_date);
         let file_name = format!("yt-{}.md", video.id);
         let file_path = person_dir.join(&file_name);
-        atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
+        let sidecar_path = person_dir.join(format!("yt-{}.dedup.json", video.id));
+
+        // Resumable, matching ingest_youtube.py's own real behavior
+        // (skip a video whose output already exists) -- lost when this
+        // was first ported to Rust, restored here after confirming the
+        // Python script had it and this one didn't (2026-08-08). A
+        // video already fetched is never re-fetched; its dedup only
+        // gets (re-)run if no sidecar exists yet either.
+        if file_path.exists() {
+            written.push(file_path.clone());
+            if !sidecar_path.exists()
+                && let Ok(existing) = std::fs::read_to_string(&file_path)
+            {
+                dedup_items.push((video.id.clone(), strip_frontmatter(&existing)));
+            }
+            continue;
+        }
+
+        let text = match fetch_captions(&yt_dlp_bin, &video.id, &person_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                failures.push((video.id.clone(), e));
+                continue;
+            }
+        };
+        let md = build_raw_transcript_md(person, slug, video, &text, ingested_date);
+        if let Err(e) = atomic::write(&file_path, &md) {
+            failures.push((video.id.clone(), e.to_string()));
+            continue;
+        }
         written.push(file_path);
         dedup_items.push((video.id.clone(), text));
+    }
+
+    if written.is_empty() {
+        let summary = failures
+            .iter()
+            .map(|(id, e)| format!("{id}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("every video failed to fetch: {summary}"));
     }
 
     if let Ok(results) = run_squishi_dedup_batch(&dedup_items) {
@@ -710,7 +779,56 @@ pub fn ingest_videos(
             let _ = atomic::write(&sidecar_path, &dedup_json);
         }
     }
-    Ok(written)
+    Ok((written, failures))
+}
+
+/// Standalone transform pass: dedupe+punctuate whatever raw `.md` files
+/// already exist for `slug`, independent of fetching — the answer to
+/// "fetch in batches, then transform separately," and the same real
+/// recovery this session ran by hand after `ingest_videos` partial
+/// failures. Skips any raw file that already has a `.dedup.json`
+/// sidecar (idempotent — re-running after a partial `ingest_videos`
+/// only processes what's actually new), unless `force` is set. Returns
+/// how many files were processed.
+pub fn dedup_raw_files(raw_dir: &Path, slug: &str, force: bool) -> Result<usize, String> {
+    let person_dir = raw_dir.join(slug);
+    if !person_dir.is_dir() {
+        return Err(format!(
+            "no raw directory for slug {slug:?}: {}",
+            person_dir.display()
+        ));
+    }
+
+    let mut items = Vec::new();
+    let entries = std::fs::read_dir(&person_dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let id = name.trim_end_matches(".md");
+        let sidecar_path = person_dir.join(format!("{id}.dedup.json"));
+        if sidecar_path.exists() && !force {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        items.push((id.to_string(), strip_frontmatter(&content)));
+    }
+
+    if items.is_empty() {
+        return Ok(0);
+    }
+
+    let results = run_squishi_dedup_batch(&items)?;
+    for (id, dedup_json) in &results {
+        let sidecar_path = person_dir.join(format!("{id}.dedup.json"));
+        atomic::write(&sidecar_path, dedup_json).map_err(|e| e.to_string())?;
+    }
+    Ok(results.len())
 }
 
 #[cfg(test)]
@@ -990,6 +1108,104 @@ mod tests {
             "2026-08-07",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn ingest_videos_skips_one_failure_and_still_returns_ok_with_the_rest() {
+        // Real resilience test: yt-dlp always fails here, but one of the
+        // two videos already has its raw file on disk -- resumability
+        // means that one is never even attempted, so it "succeeds"
+        // despite a guaranteed-failing yt-dlp, and the overall call
+        // returns Ok (partial success), not Err, because not everything
+        // failed. This is the exact class of bug found 2026-08-08: a
+        // single bad item must not discard everything else.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_fake_failing_yt_dlp(tmp.path());
+        let raw_dir = tmp.path().join("raw");
+        let person_dir = raw_dir.join("test-person");
+        std::fs::create_dir_all(&person_dir).unwrap();
+        let already_fetched_path = person_dir.join("yt-already-fetched.md");
+        std::fs::write(
+            &already_fetched_path,
+            "---\nsource: x\n---\n\n# Title\n\nreal cached content",
+        )
+        .unwrap();
+
+        let videos = vec![
+            VideoTarget {
+                id: "already-fetched".to_string(),
+                title: "already on disk".to_string(),
+            },
+            VideoTarget {
+                id: "will-fail".to_string(),
+                title: "yt-dlp will fail for this one".to_string(),
+            },
+        ];
+        let result = ingest_videos(
+            tmp.path(),
+            &raw_dir,
+            "Test Person",
+            "test-person",
+            &videos,
+            "2026-08-07",
+        );
+        let (written, failures) = result.expect("partial success should be Ok, not Err");
+        assert_eq!(written, vec![already_fetched_path]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "will-fail");
+    }
+
+    // --- dedup_raw_files: pure/fast paths, no real squishi call ---
+
+    #[test]
+    fn dedup_raw_files_errors_for_a_missing_slug_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = dedup_raw_files(tmp.path(), "no-such-slug", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dedup_raw_files_on_an_empty_directory_returns_zero_without_spawning_squishi() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("empty-slug")).unwrap();
+        let result = dedup_raw_files(tmp.path(), "empty-slug", false);
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn dedup_raw_files_skips_a_file_that_already_has_a_sidecar_unless_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let person_dir = tmp.path().join("has-sidecar");
+        std::fs::create_dir_all(&person_dir).unwrap();
+        std::fs::write(
+            person_dir.join("yt-abc.md"),
+            "---\nsource: x\n---\n\nreal body",
+        )
+        .unwrap();
+        std::fs::write(
+            person_dir.join("yt-abc.dedup.json"),
+            r#"{"already":"there"}"#,
+        )
+        .unwrap();
+
+        // Nothing left to process -> Ok(0), never spawns squishi (which
+        // would otherwise hang/error in a test environment without it).
+        let result = dedup_raw_files(tmp.path(), "has-sidecar", false);
+        assert_eq!(result, Ok(0));
+    }
+
+    // --- strip_frontmatter: pure ---
+
+    #[test]
+    fn strip_frontmatter_removes_the_yaml_block() {
+        let content = "---\nsource: x\nperson: Y\n---\n\n# Title\n\nreal body text";
+        assert_eq!(strip_frontmatter(content), "# Title\n\nreal body text");
+    }
+
+    #[test]
+    fn strip_frontmatter_on_content_without_frontmatter_returns_it_unchanged() {
+        let content = "just plain content, no frontmatter at all";
+        assert_eq!(strip_frontmatter(content), content);
     }
 
     #[test]
