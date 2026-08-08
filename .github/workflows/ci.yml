@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # `secrets` isn't a permitted context inside step `if:` conditions --
+  # mirror it into `env` here so the checkout/cache/build steps below can
+  # gate on env.SQUISHI_CHECKOUT_PAT instead.
+  SQUISHI_CHECKOUT_PAT: ${{ secrets.SQUISHI_CHECKOUT_PAT }}
 
 jobs:
   test:
@@ -30,21 +34,21 @@ jobs:
       # set, so a fork/PR from someone without it still gets a green build,
       # just without this one test's real coverage.
       - name: Checkout squishi
-        if: ${{ secrets.SQUISHI_CHECKOUT_PAT != '' }}
+        if: ${{ env.SQUISHI_CHECKOUT_PAT != '' }}
         uses: actions/checkout@v4
         with:
           repository: artisenalcode/squishi
           token: ${{ secrets.SQUISHI_CHECKOUT_PAT }}
           path: squishi-checkout
       - name: Cache squishi build
-        if: ${{ secrets.SQUISHI_CHECKOUT_PAT != '' }}
+        if: ${{ env.SQUISHI_CHECKOUT_PAT != '' }}
         id: squishi-bin-cache
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/squishi
           key: ${{ runner.os }}-squishi-bin-${{ hashFiles('squishi-checkout/Cargo.lock') }}
       - name: Build and install squishi
-        if: ${{ secrets.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
+        if: ${{ env.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
         run: cargo install --path squishi-checkout --locked
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
