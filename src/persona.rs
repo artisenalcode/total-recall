@@ -281,7 +281,7 @@ pub fn ingest_wikipedia_pages(
         let file_path = person_dir.join(&file_name);
         atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
         written.push(file_path);
-        dedup_items.push((slugify(title), text));
+        dedup_items.push((slugify(title), text, false));
     }
 
     if let Ok(results) = run_squishi_dedup_batch(&dedup_items) {
@@ -512,7 +512,7 @@ pub fn ingest_git_commits(
     let file_path = person_dir.join(&file_name);
     atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
 
-    let dedup_items = vec![(slugify(repo_name), text)];
+    let dedup_items = vec![(slugify(repo_name), text, false)];
     if let Ok(results) = run_squishi_dedup_batch(&dedup_items) {
         for (id, dedup_json) in results {
             let sidecar_path = person_dir.join(format!("git-{id}.dedup.json"));
@@ -621,7 +621,18 @@ pub fn fetch_captions(
 /// unchanged. Best-effort at the *batch* level — matching the prior
 /// per-item best-effort posture, squishi being unavailable means no
 /// sidecars for this whole batch, not a partial one.
-fn run_squishi_dedup_batch(items: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
+///
+/// Each item's `restore_punctuation` flag is a real, source-aware
+/// assertion, not left to squishi's own content-density guess: only
+/// YouTube-caption sources ever set it `true` (`ingest_videos`,
+/// `dedup_raw_files` inferring from a `yt-` filename prefix) —
+/// Wikipedia and git-commit-message sources always set it `false`,
+/// since they already have real punctuation by construction and never
+/// need the ~562MB model invoked, belt-and-suspenders alongside
+/// squishi's own heuristic rather than relying on it alone.
+fn run_squishi_dedup_batch(
+    items: &[(String, String, bool)],
+) -> Result<Vec<(String, String)>, String> {
     use std::io::Write;
 
     if items.is_empty() {
@@ -631,7 +642,9 @@ fn run_squishi_dedup_batch(items: &[(String, String)]) -> Result<Vec<(String, St
     let input = Value::Array(
         items
             .iter()
-            .map(|(id, text)| serde_json::json!({ "id": id, "text": text }))
+            .map(|(id, text, restore_punctuation)| {
+                serde_json::json!({ "id": id, "text": text, "restore_punctuation": restore_punctuation })
+            })
             .collect(),
     );
     let input_str = serde_json::to_string(&input).map_err(|e| e.to_string())?;
@@ -743,7 +756,7 @@ pub fn ingest_videos(
             if !sidecar_path.exists()
                 && let Ok(existing) = std::fs::read_to_string(&file_path)
             {
-                dedup_items.push((video.id.clone(), strip_frontmatter(&existing)));
+                dedup_items.push((video.id.clone(), strip_frontmatter(&existing), true));
             }
             continue;
         }
@@ -761,7 +774,7 @@ pub fn ingest_videos(
             continue;
         }
         written.push(file_path);
-        dedup_items.push((video.id.clone(), text));
+        dedup_items.push((video.id.clone(), text, true));
     }
 
     if written.is_empty() {
@@ -816,7 +829,17 @@ pub fn dedup_raw_files(raw_dir: &Path, slug: &str, force: bool) -> Result<usize,
             continue;
         }
         let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        items.push((id.to_string(), strip_frontmatter(&content)));
+        // Only a real YouTube caption source ever needs punctuation
+        // restoration -- inferred from this crate's own filename
+        // convention (yt-<id>.md vs wikipedia-<id>.md/git-<id>.md),
+        // since dedup_raw_files works from whatever's already on disk
+        // and has no other signal for which source type wrote a file.
+        let restore_punctuation = id.starts_with("yt-");
+        items.push((
+            id.to_string(),
+            strip_frontmatter(&content),
+            restore_punctuation,
+        ));
     }
 
     if items.is_empty() {
@@ -1220,8 +1243,8 @@ mod tests {
                          almost anything else in coaching. ";
         let text: String = std::iter::repeat_n(sentence, 20).collect();
         let items = vec![
-            ("first".to_string(), text.clone()),
-            ("second".to_string(), text),
+            ("first".to_string(), text.clone(), true),
+            ("second".to_string(), text, true),
         ];
         let result = run_squishi_dedup_batch(&items);
         assert!(
@@ -1245,5 +1268,58 @@ mod tests {
         // real, fast, no #[ignore] needed.
         let result = run_squishi_dedup_batch(&[]);
         assert_eq!(result, Ok(Vec::new()));
+    }
+
+    #[test]
+    #[ignore] // requires `squishi` installed on PATH (real subprocess, first-run model download)
+    fn run_squishi_dedup_batch_honors_restore_punctuation_false() {
+        // Real, genuinely unpunctuated text, over squishi's 2000-char
+        // semantic-dedup threshold so this actually reaches the path
+        // where punctuation_restored gets set at all -- would trigger
+        // restoration if allowed. Sent with restore_punctuation: false
+        // (as ingest_wikipedia_pages/ingest_git_commits always do), so
+        // squishi must report it was never attempted.
+        let text: String = std::iter::repeat_n("word ", 600).collect();
+        let items = vec![("wiki-item".to_string(), text, false)];
+        let results = run_squishi_dedup_batch(&items).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&results[0].1).unwrap();
+        assert_eq!(json["punctuation_restored"], false);
+    }
+
+    #[test]
+    #[ignore] // requires `squishi` installed on PATH (real subprocess, first-run model download)
+    fn dedup_raw_files_only_restores_punctuation_for_yt_prefixed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let person_dir = tmp.path().join("mixed-source-slug");
+        std::fs::create_dir_all(&person_dir).unwrap();
+
+        // Real, genuinely unpunctuated text for both, over squishi's
+        // 2000-char semantic-dedup threshold -- the only difference is
+        // the filename prefix dedup_raw_files infers eligibility from.
+        let unpunctuated: String = std::iter::repeat_n("word ", 600).collect();
+        std::fs::write(
+            person_dir.join("yt-realvideo.md"),
+            format!("---\nsource: x\n---\n\n{unpunctuated}"),
+        )
+        .unwrap();
+        std::fs::write(
+            person_dir.join("wikipedia-realpage.md"),
+            format!("---\nsource: x\n---\n\n{unpunctuated}"),
+        )
+        .unwrap();
+
+        let count = dedup_raw_files(tmp.path(), "mixed-source-slug", false).unwrap();
+        assert_eq!(count, 2);
+
+        let yt_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(person_dir.join("yt-realvideo.dedup.json")).unwrap(),
+        )
+        .unwrap();
+        let wiki_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(person_dir.join("wikipedia-realpage.dedup.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(yt_json["punctuation_restored"], true);
+        assert_eq!(wiki_json["punctuation_restored"], false);
     }
 }
