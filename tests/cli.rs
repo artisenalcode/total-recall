@@ -16,12 +16,13 @@ fn scratch_data_root() -> tempfile::TempDir {
 /// `ingest-session` shells out to the real `squishi` binary for
 /// extraction+compression (see ingest.rs's module doc) -- it's a hard
 /// dependency, not best-effort, so there's no in-process fallback to
-/// test instead. `squishi` lives in a sibling private repo with no CI
-/// build step wired up for it here yet (would need a cross-repo PAT,
-/// not currently configured -- see this repo's CI workflow). Skip
-/// gracefully rather than fail the whole suite on an environment gap
-/// that isn't a code regression; same resilience posture this codebase
-/// already applies to model/embedding availability elsewhere.
+/// test instead. `squishi` lives in a sibling private repo; CI checks it
+/// out and builds it via a fine-grained PAT (`SQUISHI_CHECKOUT_PAT`, see
+/// this repo's CI workflow) when that secret is set. Locally, or on a
+/// fork/PR without the secret, it may not be on PATH -- skip gracefully
+/// rather than fail the whole suite on an environment gap that isn't a
+/// code regression; same resilience posture this codebase already
+/// applies to model/embedding availability elsewhere.
 fn squishi_on_path() -> bool {
     Command::new("squishi")
         .arg("--help")
