@@ -7,6 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// file, then rename over the final path. Shared by wiki (per-fact files)
 /// and the bank index (index.md) — the two places Milestone 1 needs it.
 pub fn write(path: &Path, contents: &str) -> io::Result<()> {
+    write_bytes(path, contents.as_bytes())
+}
+
+/// Same tmp-then-rename discipline as `write`, for binary content (e.g.
+/// `archive.rs`'s gzip output, which isn't valid UTF-8 to write via
+/// `fs::write(&str)`). `write` is a thin wrapper over this now — one real
+/// atomic-write implementation, not two.
+pub fn write_bytes(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir)?;
     let nanos = SystemTime::now()

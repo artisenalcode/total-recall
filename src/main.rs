@@ -1,6 +1,8 @@
+mod archive;
 mod atomic;
 mod bank;
 mod concepts;
+mod config;
 mod curator;
 mod doctor;
 mod embed_cache;
@@ -9,6 +11,7 @@ mod handover;
 mod ingest;
 mod lock;
 mod persona;
+mod session_checkpoint;
 mod wiki;
 mod window;
 
@@ -105,13 +108,45 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Sweep every transcript under `~/.claude/projects/` (`
+    /// MF_CLAUDE_PROJECTS_DIR` overrides, for tests) not yet archived,
+    /// staging+archiving each (ADR-0006 Phase 1). Resumable: a second run
+    /// is a no-op over sessions already archived. Never touches the
+    /// transcript belonging to `$CLAUDE_CODE_SESSION_ID` (the invoking
+    /// process's own live session, if any) regardless of its age, and
+    /// skips anything modified in the last 10 minutes as a secondary
+    /// guard against archiving a file some other still-running session
+    /// might append to next.
+    IngestSessions {
+        /// Required, not a default-true flag -- an explicit ask, not
+        /// something that happens by just running the bare subcommand
+        /// (there's no other mode today, but making it implicit now
+        /// forecloses a future narrower selection flag reading as a
+        /// silent behavior change).
+        #[arg(long)]
+        all: bool,
+    },
     /// Extract + compress a Claude Code session transcript (via the real
     /// `squishi --session-digest`) and stage the result for handover.
     /// Rust port of `session_to_trm.py`. Stages into the bank resolved
     /// from the SESSION's own cwd (parsed from squishi's output), not
     /// the cwd `trm` itself is invoked from -- `-p/--bank` still
     /// overrides both if given explicitly.
-    IngestSession { path: PathBuf },
+    IngestSession {
+        path: PathBuf,
+        /// After staging succeeds, gzip-archive the transcript into the
+        /// resolved bank's `sessions/` tier and remove the original from
+        /// its source location. Only safe for a FINISHED session (ADR-0006
+        /// Phase 1) -- never pass this for a still-live transcript.
+        #[arg(long)]
+        archive_after: bool,
+        /// Which trigger is calling this. `manual` (default, this
+        /// command's original behavior) is never gated by `trm.json`'s
+        /// hook-enable flags; `precompact`/`sessionend` are -- a disabled
+        /// hook exits 0 silently rather than staging anyway.
+        #[arg(long, value_enum, default_value = "manual")]
+        trigger: Trigger,
+    },
     /// Fetch+clean YouTube auto-captions for a person's videos and stage
     /// a PersonaBuild handover for a sub-agent to synthesize into a
     /// persona wiki page. Mechanical only (fetch/clean/stage) -- trm
@@ -161,6 +196,17 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// Which caller is invoking `ingest-session` (ADR-0006 Phase 1). `manual`
+/// is the pre-existing, ungated behavior; `precompact`/`sessionend` are
+/// checked against `trm.json`'s `hooks.*.enabled` before staging anything.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+#[value(rename_all = "lowercase")]
+enum Trigger {
+    Precompact,
+    Sessionend,
+    Manual,
 }
 
 #[derive(Subcommand)]
@@ -314,7 +360,8 @@ pid) — never a live one.
 
 ## Ingest a Claude Code session
 
-    trm ingest-session <transcript.jsonl>
+    trm ingest-session <transcript.jsonl> [--archive-after] [--trigger manual|precompact|sessionend]
+    trm ingest-sessions --all
 
 Rust port of `session_to_trm.py` — extraction+compression now live in
 squishi (`squishi --session-digest`, which this shells out to);
@@ -324,6 +371,26 @@ from the SESSION's own cwd (parsed out of squishi's digest output), not
 whatever directory `trm ingest-session` itself is invoked from —
 `-p/--bank` still overrides both if given explicitly. Fails loudly if
 `squishi` isn't on PATH or the session has nothing to digest (empty).
+
+**Archival (ADR-0006 Phase 1, for a FINISHED session only).**
+`--archive-after` gzip-archives the transcript into the resolved bank's
+`sessions/<session-id>.jsonl.gz` and removes the source once staging
+succeeds — the source is only ever deleted after the compressed copy is
+read back and confirmed byte-identical. `trm ingest-sessions --all`
+sweeps every transcript under `~/.claude/projects/`
+(`MF_CLAUDE_PROJECTS_DIR` overrides) not yet archived and does the same;
+resumable (a second sweep is a no-op over what's already archived), and
+never touches the transcript belonging to `$CLAUDE_CODE_SESSION_ID` (the
+invoking process's own live session) or anything modified in the last 10
+minutes. `--trigger` (default `manual`, ungated) marks who's calling —
+`precompact`/`sessionend` are checked against `trm.json`'s
+`hooks.*.enabled` before staging anything; a disabled trigger exits 0
+silently. `trm.json` also gates staging via `staging.min_turns`/
+`staging.min_bytes` (both default to effectively "stage everything",
+matching pre-`trm.json` behavior). See `<data_root>/trm.json` (global)
+and `<repo_root>/.trm/trm.json` (project override, merged field-by-field
+on top) for the full schema. No live, in-session incremental staging yet
+(`PreCompact` hook wiring is ADR-0006 Phase 2, not built).
 
 ## Ingest a persona (build an advisor from YouTube)
 
@@ -584,40 +651,55 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        Commands::IngestSession { path } => match ingest::run_squishi_session_digest(&path) {
-            Ok(digest) if digest.content.trim().is_empty() => {
-                eprintln!("trm ingest-session failed: nothing to digest (empty session)");
-                ExitCode::FAILURE
+        Commands::IngestSessions { all } => {
+            if !all {
+                eprintln!("trm ingest-sessions: pass --all (the only mode today)");
+                return ExitCode::FAILURE;
             }
-            Ok(digest) => {
-                let reason = ingest::build_reason(&digest);
-                // The session's OWN cwd (parsed from squishi's output),
-                // not the invoking process's cwd -- the one real
-                // behavior ported exactly from session_to_trm.py, so
-                // bank resolution matches what running `trm` from
-                // inside the session's own project would have done.
-                let session_cwd = digest
-                    .cwd
-                    .as_ref()
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| cwd.clone());
-                match stage(
-                    &data_root,
-                    &session_cwd,
-                    cli.bank.as_deref(),
-                    &digest.content,
-                    &reason,
-                    "direct",
-                ) {
-                    Ok(job_id) => {
-                        println!("staged: {job_id}");
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => {
-                        eprintln!("trm ingest-session failed: {e}");
-                        ExitCode::FAILURE
-                    }
+            let projects_dir = ingest::claude_projects_dir();
+            let current_session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+            let stats =
+                ingest_sessions_all(&data_root, &projects_dir, current_session_id.as_deref());
+            println!(
+                "scanned {}: {} archived, {} already archived, {} current session, \
+                 {} recently modified, {} below threshold, {} errors",
+                projects_dir.display(),
+                stats.archived,
+                stats.skipped_already_archived,
+                stats.skipped_current_session,
+                stats.skipped_recent_mtime,
+                stats.skipped_below_threshold,
+                stats.errors
+            );
+            if stats.errors > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Commands::IngestSession {
+            path,
+            archive_after,
+            trigger,
+        } => match ingest_session(
+            &data_root,
+            &cwd,
+            cli.bank.as_deref(),
+            &path,
+            archive_after,
+            trigger,
+        ) {
+            Ok(IngestOutcome::Staged { job_id, archived }) => {
+                if archived {
+                    println!("staged: {job_id} (archived)");
+                } else {
+                    println!("staged: {job_id}");
                 }
+                ExitCode::SUCCESS
+            }
+            Ok(IngestOutcome::Skipped(reason)) => {
+                println!("skipped: {reason}");
+                ExitCode::SUCCESS
             }
             Err(e) => {
                 eprintln!("trm ingest-session failed: {e}");
@@ -890,6 +972,186 @@ fn stage(
     handover::stage(&paths, content, reason, source).map_err(|e| e.to_string())
 }
 
+/// What `ingest_session` actually did — `main()`'s match arm reports this
+/// back to the user; a skip is not an error (a disabled hook or a
+/// below-threshold session behaving exactly as configured).
+enum IngestOutcome {
+    Skipped(String),
+    Staged { job_id: String, archived: bool },
+}
+
+/// Full `trm ingest-session` flow, pulled out of `main()`'s match arm so
+/// it's independently testable against real fixtures — same reasoning
+/// `stage`/`pending` already established for this file's other command
+/// bodies. ADR-0006 Phase 1: whole-transcript digest + stage, optionally
+/// followed by archiving the source transcript. No line-level checkpoint
+/// here — that's Phase 2's live-compaction concern (see the plan doc).
+fn ingest_session(
+    data_root: &std::path::Path,
+    cwd: &std::path::Path,
+    explicit_bank: Option<&str>,
+    transcript_path: &std::path::Path,
+    archive_after: bool,
+    trigger: Trigger,
+) -> Result<IngestOutcome, String> {
+    let digest = ingest::run_squishi_session_digest(transcript_path)?;
+    if digest.content.trim().is_empty() {
+        return Err("nothing to digest (empty session)".to_string());
+    }
+
+    // The session's OWN cwd (parsed from squishi's output), not the
+    // invoking process's cwd — same real behavior `stage`'s caller
+    // already preserves for the non-checkpointed path.
+    let session_cwd = digest
+        .cwd
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cwd.to_path_buf());
+
+    let config = config::load(data_root, &session_cwd)?;
+
+    let hook_enabled = match trigger {
+        Trigger::Precompact => config.pre_compact_enabled,
+        Trigger::Sessionend => config.session_end_enabled,
+        Trigger::Manual => true, // never gated -- pre-existing, ungated behavior
+    };
+    if !hook_enabled {
+        return Ok(IngestOutcome::Skipped(format!(
+            "{trigger:?} hook disabled in trm.json"
+        )));
+    }
+
+    if digest.turn_count < config.min_turns || digest.content.len() < config.min_bytes {
+        return Ok(IngestOutcome::Skipped(format!(
+            "below staging threshold (turn_count={} < min_turns={} or bytes={} < min_bytes={})",
+            digest.turn_count,
+            config.min_turns,
+            digest.content.len(),
+            config.min_bytes
+        )));
+    }
+
+    let reason = ingest::build_reason(&digest);
+    let job_id = stage(
+        data_root,
+        &session_cwd,
+        explicit_bank,
+        &digest.content,
+        &reason,
+        "direct",
+    )?;
+
+    if !archive_after {
+        return Ok(IngestOutcome::Staged {
+            job_id,
+            archived: false,
+        });
+    }
+
+    let bank_id = bank::resolve_bank_id(explicit_bank, &session_cwd);
+    let paths = bank::paths_for(data_root, &bank_id);
+    let session_id = digest.session_id.clone().unwrap_or_else(|| job_id.clone());
+    let dest = paths.sessions.join(format!("{session_id}.jsonl.gz"));
+    archive::archive_transcript(transcript_path, &dest).map_err(|e| e.to_string())?;
+
+    let mut checkpoint = session_checkpoint::load(&paths.session_state);
+    session_checkpoint::mark_archived(&mut checkpoint, &session_id);
+    session_checkpoint::save(&paths.session_state, &checkpoint).map_err(|e| e.to_string())?;
+
+    Ok(IngestOutcome::Staged {
+        job_id,
+        archived: true,
+    })
+}
+
+/// How long a transcript must sit untouched before `ingest_sessions_all`
+/// will consider archiving it — the secondary guard for when
+/// `$CLAUDE_CODE_SESSION_ID` isn't set (`trm` run outside any live Claude
+/// Code session). Not yet configurable via `trm.json` (see the plan's
+/// Risks section) — a fixed constant until real usage shows it needs to be.
+const RECENT_MTIME_GUARD_SECS: u64 = 600;
+
+#[derive(Debug, Default, PartialEq)]
+struct SweepStats {
+    archived: usize,
+    skipped_already_archived: usize,
+    skipped_current_session: usize,
+    skipped_recent_mtime: usize,
+    skipped_below_threshold: usize,
+    errors: usize,
+}
+
+/// `trm ingest-sessions --all`'s real work: walk every transcript under
+/// `projects_dir`, skip what's clearly not eligible (already archived,
+/// the caller's own live session, too recently modified), and run the
+/// same stage-then-archive path `ingest_session --archive-after` uses for
+/// everything else. One bad file never aborts the sweep — logged to
+/// stderr, counted, moved on — same "not a versioned contract" discipline
+/// every other transcript-reading path in this codebase already follows.
+fn ingest_sessions_all(
+    data_root: &std::path::Path,
+    projects_dir: &std::path::Path,
+    current_session_id: Option<&str>,
+) -> SweepStats {
+    let mut stats = SweepStats::default();
+
+    for path in ingest::find_transcripts(projects_dir) {
+        let Some((session_id, session_cwd)) = ingest::peek_session_meta(&path) else {
+            eprintln!(
+                "trm ingest-sessions: {} has no usable sessionId/cwd line, skipping",
+                path.display()
+            );
+            stats.errors += 1;
+            continue;
+        };
+
+        if current_session_id == Some(session_id.as_str()) {
+            stats.skipped_current_session += 1;
+            continue;
+        }
+
+        let bank_id = bank::resolve_bank_id(None, &session_cwd);
+        let paths = bank::paths_for(data_root, &bank_id);
+        let checkpoint = session_checkpoint::load(&paths.session_state);
+        if session_checkpoint::is_archived(&checkpoint, &session_id) {
+            stats.skipped_already_archived += 1;
+            continue;
+        }
+
+        let recently_modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .and_then(|modified| {
+                modified
+                    .elapsed()
+                    .map_err(|e| io::Error::other(e.to_string()))
+            })
+            .map(|elapsed| elapsed.as_secs() < RECENT_MTIME_GUARD_SECS)
+            .unwrap_or(false);
+        if recently_modified {
+            stats.skipped_recent_mtime += 1;
+            continue;
+        }
+
+        match ingest_session(data_root, &session_cwd, None, &path, true, Trigger::Manual) {
+            Ok(IngestOutcome::Staged { archived: true, .. }) => stats.archived += 1,
+            Ok(IngestOutcome::Staged {
+                archived: false, ..
+            }) => {
+                // Can't happen with archive_after=true, but not a panic-
+                // worthy invariant break either -- count it and move on.
+                stats.errors += 1;
+            }
+            Ok(IngestOutcome::Skipped(_)) => stats.skipped_below_threshold += 1,
+            Err(e) => {
+                eprintln!("trm ingest-sessions: {} failed: {e}", path.display());
+                stats.errors += 1;
+            }
+        }
+    }
+
+    stats
+}
+
 /// Resolve the bank and list its open handover jobs. No lock needed —
 /// same as recall, this is a read.
 fn pending(
@@ -1058,6 +1320,14 @@ mod tests {
     fn core_docs_covers_ingest_session() {
         assert!(CORE_DOCS.contains("trm ingest-session"));
         assert!(CORE_DOCS.contains("SESSION's own cwd"));
+    }
+
+    #[test]
+    fn core_docs_covers_session_archival() {
+        assert!(CORE_DOCS.contains("trm ingest-sessions --all"));
+        assert!(CORE_DOCS.contains("--archive-after"));
+        assert!(CORE_DOCS.contains("trm.json"));
+        assert!(CORE_DOCS.contains("CLAUDE_CODE_SESSION_ID"));
     }
 
     #[test]
