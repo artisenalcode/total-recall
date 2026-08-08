@@ -149,6 +149,18 @@ enum Commands {
         #[arg(long, default_value = "direct")]
         source: String,
     },
+    /// Standalone dedup/punctuation-restoration pass over raw files
+    /// already on disk for a slug -- no fetching, no network beyond
+    /// what squishi itself needs for its models. The explicit answer to
+    /// "fetch in batches, then transform separately": re-runnable
+    /// anytime after `ingest-persona`, safe to retry, skips files that
+    /// already have a `.dedup.json` sidecar unless --force is given.
+    DedupRaw {
+        #[arg(long)]
+        slug: String,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -675,7 +687,22 @@ fn main() -> ExitCode {
                 match persona::ingest_videos(
                     &data_root, &paths.raw, &person, &slug, &videos, &today,
                 ) {
-                    Ok(mut paths) => source_paths.append(&mut paths),
+                    Ok((mut paths, failures)) => {
+                        let succeeded = paths.len();
+                        source_paths.append(&mut paths);
+                        for (id, e) in &failures {
+                            eprintln!("warning: video {id} failed, skipped: {e}");
+                        }
+                        if !failures.is_empty() {
+                            eprintln!(
+                                "video source: {succeeded}/{} succeeded ({} skipped -- \
+                                 re-run the same command to retry just the failures, \
+                                 already-fetched videos won't be re-fetched)",
+                                succeeded + failures.len(),
+                                failures.len()
+                            );
+                        }
+                    }
                     Err(e) => {
                         eprintln!("trm ingest-persona failed (video source): {e}");
                         return ExitCode::FAILURE;
@@ -730,6 +757,20 @@ fn main() -> ExitCode {
                         eprintln!("trm ingest-persona failed: {e}");
                         ExitCode::FAILURE
                     }
+                }
+            }
+        }
+        Commands::DedupRaw { slug, force } => {
+            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            let paths = bank::paths_for(&data_root, &bank_id);
+            match persona::dedup_raw_files(&paths.raw, &slug, force) {
+                Ok(count) => {
+                    println!("dedup-raw: processed {count} raw file(s) for {slug:?}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm dedup-raw failed: {e}");
+                    ExitCode::FAILURE
                 }
             }
         }
