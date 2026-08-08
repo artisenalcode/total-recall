@@ -14,7 +14,7 @@
 //! instead of the ambient `std::env::current_dir()`.
 
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -91,9 +91,126 @@ pub fn run_squishi_session_digest(path: &Path) -> Result<SessionDigest, String> 
     parse_squishi_json(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Where `trm ingest-sessions --all` (ADR-0006 Phase 1) looks for
+/// transcripts. `MF_CLAUDE_PROJECTS_DIR` overrides for tests, same
+/// precedent as `bank::data_root`'s `MF_DATA_ROOT`; defaults to Claude
+/// Code's real, undocumented-but-observed layout, `~/.claude/projects`.
+pub fn claude_projects_dir() -> PathBuf {
+    if let Ok(over) = std::env::var("MF_CLAUDE_PROJECTS_DIR") {
+        return PathBuf::from(over);
+    }
+    let home = std::env::var("HOME").expect("HOME must be set to locate ~/.claude/projects");
+    PathBuf::from(home).join(".claude").join("projects")
+}
+
+/// Every `*.jsonl` file directly under `projects_dir`'s immediate
+/// subdirectories (`<projects_dir>/<project>/<session-id>.jsonl`, the
+/// real layout confirmed against this repo's own `~/.claude/projects/`).
+/// Defensive: an unreadable `projects_dir` or subdirectory yields fewer
+/// results, never a hard error — matches every other transcript-reading
+/// path in this codebase's "not a versioned contract" discipline.
+pub fn find_transcripts(projects_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(project_dirs) = std::fs::read_dir(projects_dir) else {
+        return out;
+    };
+    for project_entry in project_dirs.flatten() {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&project_path) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            let file_path = file_entry.path();
+            if file_path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                out.push(file_path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A cheap peek at a transcript's `sessionId`/`cwd`, without spawning
+/// squishi — just the first line that carries both non-null (skips the
+/// real, observed leading `{"type":"mode", ..., "cwd": null}` line).
+/// Lets `ingest-sessions --all` resolve which bank's checkpoint to check
+/// *before* paying for a real digest, for sessions it's about to skip
+/// anyway.
+pub fn peek_session_meta(path: &Path) -> Option<(String, PathBuf)> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let session_id = value.get("sessionId").and_then(|v| v.as_str());
+        let cwd = value.get("cwd").and_then(|v| v.as_str());
+        if let (Some(session_id), Some(cwd)) = (session_id, cwd) {
+            return Some((session_id.to_string(), PathBuf::from(cwd)));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- find_transcripts / peek_session_meta: pure(ish), real fixture dirs ---
+
+    #[test]
+    fn find_transcripts_finds_jsonl_under_project_subdirectories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_a = tmp.path().join("-home-alvin-repo-a");
+        let project_b = tmp.path().join("-home-alvin-repo-b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        std::fs::write(project_a.join("sess-1.jsonl"), "{}").unwrap();
+        std::fs::write(project_a.join("not-a-transcript.txt"), "ignore me").unwrap();
+        std::fs::write(project_b.join("sess-2.jsonl"), "{}").unwrap();
+
+        let found = find_transcripts(tmp.path());
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|p| p.ends_with("sess-1.jsonl")));
+        assert!(found.iter().any(|p| p.ends_with("sess-2.jsonl")));
+    }
+
+    #[test]
+    fn find_transcripts_on_missing_dir_returns_empty_not_a_panic() {
+        let found = find_transcripts(Path::new("/does/not/exist/at/all"));
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn peek_session_meta_skips_the_leading_mode_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sess.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"mode\",\"sessionId\":\"sess-1\",\"cwd\":null}\n\
+             {\"type\":\"user\",\"sessionId\":\"sess-1\",\"cwd\":\"/repo/a\"}\n",
+        )
+        .unwrap();
+
+        let (session_id, cwd) = peek_session_meta(&path).unwrap();
+        assert_eq!(session_id, "sess-1");
+        assert_eq!(cwd, PathBuf::from("/repo/a"));
+    }
+
+    #[test]
+    fn peek_session_meta_on_a_file_with_no_usable_line_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sess.jsonl");
+        std::fs::write(&path, "not json\n{\"type\":\"mode\",\"cwd\":null}\n").unwrap();
+        assert!(peek_session_meta(&path).is_none());
+    }
 
     /// Real shape — matches squishi's actual `--session-digest --json`
     /// output exactly (verified live against the real binary before

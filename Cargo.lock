@@ -2545,6 +2545,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fastembed",
+ "flate2",
  "serde_json",
  "tempfile",
  "ureq",

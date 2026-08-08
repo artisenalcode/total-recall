@@ -16,6 +16,13 @@ pub struct BankPaths {
     pub raw: PathBuf,
     pub index: PathBuf,
     pub pending: PathBuf,
+    /// Archived original session transcripts (ADR-0006) —
+    /// `<session_id>.jsonl.gz`, one per archived session.
+    pub sessions: PathBuf,
+    /// Per-session archival checkpoint (ADR-0006 Phase 1: just an
+    /// `archived` flag per session id — no line-offset tracking yet,
+    /// that's Phase 2's live-compaction concern).
+    pub session_state: PathBuf,
 }
 
 /// The data root for all banks. `MF_DATA_ROOT` overrides for tests /
@@ -35,6 +42,8 @@ pub fn paths_for(data_root: &Path, bank_id: &str) -> BankPaths {
         raw: root.join("raw"),
         index: root.join("index.md"),
         pending: root.join("pending"),
+        sessions: root.join("sessions"),
+        session_state: root.join(".session-state.json"),
         root,
     }
 }
@@ -100,8 +109,12 @@ fn mf_bank_file(repo_root: &Path) -> Option<String> {
     }
 }
 
-/// Walk upward from `start` looking for a `.git` directory.
-fn find_repo_root(start: &Path) -> Option<PathBuf> {
+/// Walk upward from `start` looking for a `.git` directory. `pub(crate)`
+/// so `config.rs` can reuse the exact same repo-root resolution for
+/// `trm.json`'s project-level override — the same repo a session's cwd
+/// belongs to is the same repo whose `.trm-bank` would apply, no reason
+/// for a second, differently-behaved walk-up.
+pub(crate) fn find_repo_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         if dir.join(".git").is_dir() {
@@ -261,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn paths_for_derives_the_four_bank_subpaths() {
+    fn paths_for_derives_the_six_bank_subpaths() {
         let data_root = Path::new("/tmp/example-root");
         let paths = paths_for(data_root, "global");
         assert_eq!(paths.root, data_root.join("banks/global"));
@@ -269,6 +282,11 @@ mod tests {
         assert_eq!(paths.raw, data_root.join("banks/global/raw"));
         assert_eq!(paths.index, data_root.join("banks/global/index.md"));
         assert_eq!(paths.pending, data_root.join("banks/global/pending"));
+        assert_eq!(paths.sessions, data_root.join("banks/global/sessions"));
+        assert_eq!(
+            paths.session_state,
+            data_root.join("banks/global/.session-state.json")
+        );
     }
 
     #[test]
