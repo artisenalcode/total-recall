@@ -168,10 +168,19 @@ impl HandoverTask {
 /// jordan-peterson.md file built with them) — embedded here so a
 /// sub-agent picking up a PersonaBuild handover has the actual
 /// instructions in hand, not a pointer to go re-derive them.
+///
+/// Output shape updated 2026-08-08 (advisory/knowledge/README.md's
+/// "Indexed persona" pattern): Peterson and Sugarman were both built as
+/// one flat wiki page first, then split into an index + section files
+/// in two follow-up passes once the flat file's always-loaded cost
+/// became visible in practice. Write straight into the indexed shape
+/// from here on — there's no reason to ship the flat intermediate now
+/// that the target shape is known.
 const PERSONA_BUILD_CRITERIA: &str = "\n\n\
-PERSONA BUILD — synthesize the source transcripts above into one persona wiki page. \
-Read all sources together before writing; this is one holistic authoring task, not a \
-per-sentence judgment (deliberately not concept-split — see HandoverKind::PersonaBuild).\n\n\
+PERSONA BUILD — synthesize the source transcripts above into an INDEXED persona wiki: an \
+index file plus one file per section (see Output format below), not one flat page. Read all \
+sources together before writing; this is one holistic authoring task, not a per-sentence \
+judgment (deliberately not concept-split — see HandoverKind::PersonaBuild).\n\n\
 Capture criteria (co-developed with Dr. Roy Sugarman, a real clinical neuropsychologist \
 advisor in this store):\n\
 1. Process/mechanism, not trait labels — how they think, not a score.\n\
@@ -187,8 +196,31 @@ corpus-evidenced and still be actively contested by domain experts — tag that 
 7. An explicit scope boundary — what they're actually credentialed/practiced in vs. what \
 they merely commented on once, AND distinguish self-disclosed limitations from claims \
 inside their stated expertise that others have actually disputed.\n\n\
-When done: write the wiki page to the resolved bank's wiki tier (same format as every other \
-entry in this store — frontmatter + sections), then `trm complete-handover <job-id> \"<summary>\"`.";
+Output format — write these files directly, don't stage a flat page and split it later:\n\
+- `wiki/<slug>.md` — the INDEX. The only file that loads by default, so keep it small: a \
+one-paragraph identity line; GUARDRAILS inline (the warmth caveat from #4, the scope boundary \
+from #7, and — personal advisors only — a condensed relationship-to-user block from #3); the \
+Recurring-stories retrieval table from #5; and a routing table naming which section file below \
+answers which kind of question. Guardrails stay inline because skipping them on an unrelated \
+query is a correctness risk, not just an efficiency loss — everything else below is indexed \
+out because it only matters when the question is actually about that.\n\
+- `wiki/<slug>-bio.md` — biography/credentials (gender-neutral filename regardless of subject).\n\
+- `wiki/<slug>-values.md` — item #2, in full.\n\
+- `wiki/<slug>-mechanism.md` — item #1, in full ('how they reason, not conclusions').\n\
+- `wiki/<slug>-frameworks.md` — named frameworks/models, one-line definition each, pointing \
+into the enrichment stories from #5 for worked examples.\n\
+- `wiki/<slug>-stances.md` — positions/opinions AND why they hold them.\n\
+- `wiki/<slug>-voice.md` — voice/style markers for emulation.\n\
+- `wiki/<slug>-provenance.md` — corpus mechanics: word/lexicon counts, source list, build notes, \
+the provenance tags from #6. Never loaded by default; pulled only for a corpus-mechanics \
+question, not a substantive one.\n\
+- `wiki/<slug>-enrichment/NN-<story-slug>.md` — one file per recurring story from #5, each with \
+a `concept:` frontmatter tag matching its row in the index's retrieval table.\n\n\
+If the corpus is genuinely small (a couple of sources, a handful of stories), collapse sparse \
+section files together rather than forcing every one into existence for its own sake — the \
+index/guardrail split is the part that matters, not the file count.\n\n\
+When done: write all of the above to the resolved bank's wiki tier, then `trm complete-handover \
+<job-id> \"<summary>\"`.";
 
 /// Stage raw content for extraction: write it into the raw tier, then
 /// drop a pending marker (the rendered prompt) so `list_pending` and a
