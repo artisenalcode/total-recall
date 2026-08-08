@@ -22,5 +22,11 @@ jobs:
         with:
           path: ~/.trm/models
           key: ${{ runner.os }}-total-recall-embedding-model-v2
+      # ingest_session_stages_into_the_bank_resolved_from_the_session_s_own_cwd
+      # (tests/cli.rs) needs the real `squishi` binary on PATH and skips itself
+      # here since it isn't -- squishi lives in a sibling private repo with no
+      # cross-repo checkout wired up (would need a PAT secret, not configured).
+      # If that's added later, install squishi in a step above this one and
+      # the test starts exercising the real path automatically, no code change.
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
