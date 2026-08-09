@@ -1013,10 +1013,14 @@ fn main() -> ExitCode {
                         &today,
                     ) {
                         Ok(mut paths) => source_paths.append(&mut paths),
-                        Err(e) => {
-                            eprintln!("trm ingest-persona failed (git source): {e}");
-                            return ExitCode::FAILURE;
-                        }
+                        // Non-fatal: a multi-source call (e.g. also
+                        // --wikipedia/--website) shouldn't lose already-
+                        // fetched sources over one repo genuinely having
+                        // no matching commits for the given author(s) --
+                        // same resilience posture as --video/--website
+                        // below, not the "abort the whole call" behavior
+                        // this used to have.
+                        Err(e) => eprintln!("warning: git-commits source failed, skipped: {e}"),
                     }
                 }
                 if !github_user.is_empty() {
@@ -1029,10 +1033,11 @@ fn main() -> ExitCode {
                         &today,
                     ) {
                         Ok(mut paths) => source_paths.append(&mut paths),
-                        Err(e) => {
-                            eprintln!("trm ingest-persona failed (git-issues source): {e}");
-                            return ExitCode::FAILURE;
-                        }
+                        // Non-fatal for the same reason as git-commits
+                        // above -- a real, common case: the repo owner's
+                        // own repo often has zero issues *authored by*
+                        // them (issues are usually filed by others).
+                        Err(e) => eprintln!("warning: git-issues source failed, skipped: {e}"),
                     }
                 }
             }
@@ -1079,6 +1084,17 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 }
+            }
+
+            // Every source that can fail independently (git-commits,
+            // git-issues) now does so non-fatally (see above) -- so this
+            // is the one place left that must catch "nothing usable
+            // came out of any source" before staging an empty handover.
+            if source_paths.is_empty() {
+                eprintln!(
+                    "trm ingest-persona failed: every requested source failed or matched nothing -- see warnings above"
+                );
+                return ExitCode::FAILURE;
             }
 
             {
