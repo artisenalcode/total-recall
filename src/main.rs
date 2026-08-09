@@ -181,6 +181,15 @@ enum Commands {
         /// often uses more than one email across repos/years).
         #[arg(long = "git-author")]
         git_author: Vec<String>,
+        /// Repeatable: a path to a Claude Code session transcript
+        /// (plain `.jsonl`, or a `sessions/<id>.jsonl.gz` archive --
+        /// both accepted transparently). ADR-0007: builds the USER'S
+        /// OWN self-persona from real session content, not a
+        /// third-party advisor -- always stages into the fixed `self`
+        /// bank regardless of cwd/`-p`, and cannot be combined with
+        /// `--video`/`--wikipedia`/`--git-repo` in the same call.
+        #[arg(long = "session")]
+        sessions: Vec<PathBuf>,
         #[arg(long, default_value = "direct")]
         source: String,
     },
@@ -413,6 +422,27 @@ psychology advisor in this store) for the sub-agent completing the job.
 Mechanical only — trm never calls an LLM itself, per ADR-0002; synthesis
 happens when a sub-agent reads the pending prompt and writes the actual
 wiki page via `trm complete-handover`.
+
+**`--session` (ADR-0007): the user's own self-persona, from real session
+transcripts.**
+
+    trm ingest-persona --person "Full Name" --slug the-slug \
+        --session ~/.claude/projects/.../sess-a.jsonl \
+        --session ~/.trm/banks/some-project/sessions/sess-b.jsonl.gz
+
+Repeatable, hand-picked (no bulk/glob mode) — accepts both a plain
+`.jsonl` transcript and the archived `sessions/<id>.jsonl.gz` format
+(ADR-0006) transparently, gzip-detected by extension. Reuses squishi's
+`--session-digest` wholesale for extraction — no separate self-voice-only
+pass. Always stages into the fixed `self` bank, ignoring `-p`/`--bank`
+and the session's own cwd entirely (prints an informational note if `-p`
+was also passed) — the one source type here where "whatever bank you're
+standing in" is wrong. It cannot be combined with `--video`/`--wikipedia`/
+`--git-repo` in the same call (hard error). The staged `PersonaBuild`
+handover renders self-persona-framed criteria, not the third-party-
+advisor framing `--video`/`--wikipedia`/`--git-repo` get — item #3
+("personally-supplied relational layer") doesn't apply when the subject
+IS the requester.
 
 ## Where facts live
 
@@ -713,17 +743,33 @@ fn main() -> ExitCode {
             wikipedia,
             git_repo,
             git_author,
+            sessions,
             source,
         } => {
-            if videos.is_empty() && wikipedia.is_empty() && git_repo.is_none() {
+            let has_advisor_source =
+                !videos.is_empty() || !wikipedia.is_empty() || git_repo.is_some();
+            if !has_advisor_source && sessions.is_empty() {
                 eprintln!(
-                    "trm ingest-persona failed: at least one source is required (--video, --wikipedia, and/or --git-repo)"
+                    "trm ingest-persona failed: at least one source is required (--video, --wikipedia, --git-repo, or --session)"
                 );
                 return ExitCode::FAILURE;
             }
             if git_repo.is_some() && git_author.is_empty() {
                 eprintln!(
                     "trm ingest-persona failed: --git-repo requires at least one --git-author"
+                );
+                return ExitCode::FAILURE;
+            }
+            // ADR-0007: --session builds the user's own self-persona from
+            // real session content -- a fundamentally different corpus
+            // than an advisor's public-record sources, always routed to
+            // a different bank (see below). Mixing the two in one call
+            // would blur that distinction, so it's a hard error rather
+            // than silently staging advisor + self content together.
+            if !sessions.is_empty() && has_advisor_source {
+                eprintln!(
+                    "trm ingest-persona failed: --session cannot be combined with \
+                     --video/--wikipedia/--git-repo in the same call"
                 );
                 return ExitCode::FAILURE;
             }
@@ -748,7 +794,24 @@ fn main() -> ExitCode {
                 }
             };
 
-            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            // --session always stages into the fixed self bank (ADR-0007
+            // Decision 2) -- -p/--bank's normal override doesn't apply
+            // here, since routing self-persona content elsewhere would
+            // defeat the point. An explicit -p alongside --session is
+            // not an error, just informational: the user may not expect
+            // it to be silently ignored.
+            let bank_id = if !sessions.is_empty() {
+                if cli.bank.is_some() {
+                    eprintln!(
+                        "note: -p/--bank is ignored for --session sources -- always stages \
+                         into the {:?} bank",
+                        persona::SELF_PERSONA_BANK
+                    );
+                }
+                persona::SELF_PERSONA_BANK.to_string()
+            } else {
+                bank::resolve_bank_id(cli.bank.as_deref(), &cwd)
+            };
             let paths = bank::paths_for(&data_root, &bank_id);
             if let Err(e) = fs::create_dir_all(&paths.root) {
                 eprintln!("trm ingest-persona failed: {e}");
@@ -818,18 +881,48 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            if !sessions.is_empty() {
+                match persona::ingest_sessions(&paths.raw, &person, &slug, &sessions, &today) {
+                    Ok((mut paths, failures)) => {
+                        let succeeded = paths.len();
+                        source_paths.append(&mut paths);
+                        for (label, e) in &failures {
+                            eprintln!("warning: session {label} failed, skipped: {e}");
+                        }
+                        if !failures.is_empty() {
+                            eprintln!(
+                                "session source: {succeeded}/{} succeeded ({} skipped)",
+                                succeeded + failures.len(),
+                                failures.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("trm ingest-persona failed (session source): {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
 
             {
-                let description = format!(
-                    "Build a persona wiki page for {person} from {} raw source(s)",
-                    source_paths.len()
-                );
+                let description = if !sessions.is_empty() {
+                    format!(
+                        "Build a self-persona wiki page for {person} from {} raw session source(s)",
+                        source_paths.len()
+                    )
+                } else {
+                    format!(
+                        "Build a persona wiki page for {person} from {} raw source(s)",
+                        source_paths.len()
+                    )
+                };
                 match handover::stage_persona_sources(
                     &paths,
                     &slug,
                     source_paths,
                     &description,
                     &source,
+                    !sessions.is_empty(),
                 ) {
                     Ok(job_id) => {
                         println!("staged: {job_id}");
@@ -1335,6 +1428,13 @@ mod tests {
         assert!(CORE_DOCS.contains("trm ingest-persona"));
         assert!(CORE_DOCS.contains("PersonaBuild"));
         assert!(CORE_DOCS.contains("bin/yt-dlp"));
+    }
+
+    #[test]
+    fn core_docs_covers_session_persona_source() {
+        assert!(CORE_DOCS.contains("--session"));
+        assert!(CORE_DOCS.contains("self"));
+        assert!(CORE_DOCS.contains("cannot be combined"));
     }
 
     #[test]
