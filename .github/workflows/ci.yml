@@ -59,6 +59,13 @@ jobs:
           key: ${{ runner.os }}-squishi-bin-${{ steps.squishi-sha.outputs.sha }}
       - name: Build and install squishi
         if: ${{ env.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
-        run: cargo install --path squishi-checkout --locked
+        # --force: a squishi-bin-cache MISS (this step's own gate) doesn't
+        # mean ~/.cargo/bin is actually empty -- Swatinem/rust-cache above
+        # caches ~/.cargo/bin broadly, so a squishi binary built and
+        # cached under a PRIOR run's cache key can still land here via
+        # that layer, and `cargo install` refuses to overwrite without
+        # this flag. Harmless either way: we always want the freshly
+        # built binary for squishi-checkout's actual current commit.
+        run: cargo install --path squishi-checkout --locked --force
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
