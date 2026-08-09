@@ -56,15 +56,39 @@ pub fn ensure_index(index_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Append a one-line entry for `slug` to index.md's Entries section.
-/// Milestone 1 keeps this intentionally simple (append at end of file,
-/// no structural markdown parsing) — revisit if that gets confusing once
-/// Milestone 2 needs to remove/reorder entries during curation.
+/// Upsert a one-line entry for `slug` in index.md's Entries section: if a
+/// line for this slug already exists, replace it in place; otherwise
+/// append. Not a blind append (bug found 2026-08-09 during persona
+/// reingestion: `handover::complete` re-indexing the same slug a second
+/// time -- e.g. after a PersonaBuild synthesis -- produced a stale
+/// duplicate line that had to be hand-removed). Still intentionally
+/// simple line-based matching, not structural markdown parsing.
 pub fn append_index_entry(index_path: &Path, slug: &str, summary: &str) -> io::Result<()> {
     ensure_index(index_path)?;
-    let mut contents = std::fs::read_to_string(index_path)?;
-    contents.push_str(&format!("- `{slug}` — {summary}\n"));
-    atomic::write(index_path, &contents)
+    let contents = std::fs::read_to_string(index_path)?;
+    let marker = format!("- `{slug}` — ");
+    let new_line = format!("{marker}{summary}");
+
+    let mut replaced = false;
+    let mut lines: Vec<String> = contents
+        .lines()
+        .map(|line| {
+            if line.starts_with(&marker) {
+                replaced = true;
+                new_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    if !replaced {
+        lines.push(new_line);
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    atomic::write(index_path, &out)
 }
 
 /// First ~60 chars of content, single line, for the index summary.
@@ -308,6 +332,42 @@ mod tests {
         append_index_entry(&index_path, "some-slug-abc123", "a one-line summary").unwrap();
         let contents = fs::read_to_string(&index_path).unwrap();
         assert!(contents.contains("`some-slug-abc123` — a one-line summary"));
+    }
+
+    /// Bug found 2026-08-09: calling this twice for the same slug (e.g.
+    /// `handover::complete` re-indexing after a PersonaBuild synthesis)
+    /// used to append a second line instead of updating the first,
+    /// producing a stale duplicate that had to be hand-removed. Must
+    /// upsert by slug, not blindly append.
+    #[test]
+    fn append_index_entry_replaces_the_existing_line_for_the_same_slug_instead_of_duplicating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_path = tmp.path().join("index.md");
+        append_index_entry(&index_path, "andrej-karpathy", "stale summary").unwrap();
+        append_index_entry(&index_path, "andrej-karpathy", "fresh summary").unwrap();
+
+        let contents = fs::read_to_string(&index_path).unwrap();
+        assert_eq!(
+            contents.matches("`andrej-karpathy`").count(),
+            1,
+            "expected exactly one entry line for the slug, got duplicates:\n{contents}"
+        );
+        assert!(contents.contains("fresh summary"));
+        assert!(!contents.contains("stale summary"));
+    }
+
+    #[test]
+    fn append_index_entry_leaves_other_slugs_untouched_when_upserting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_path = tmp.path().join("index.md");
+        append_index_entry(&index_path, "slug-a", "summary a").unwrap();
+        append_index_entry(&index_path, "slug-b", "summary b").unwrap();
+        append_index_entry(&index_path, "slug-a", "summary a v2").unwrap();
+
+        let contents = fs::read_to_string(&index_path).unwrap();
+        assert!(contents.contains("`slug-a` — summary a v2"));
+        assert!(!contents.contains("summary a\n"));
+        assert!(contents.contains("`slug-b` — summary b"));
     }
 
     #[test]

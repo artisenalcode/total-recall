@@ -437,8 +437,26 @@ pub fn get_prompt(paths: &bank::BankPaths, job_id: &str) -> io::Result<String> {
 /// the pending marker. The raw source stays in the raw tier — not
 /// deleted, kept for audit.
 pub fn complete(paths: &bank::BankPaths, job_id: &str, result: &str) -> io::Result<()> {
-    wiki::write_named(&paths.wiki, job_id, result)?;
-    let summary = bank::summarize(result);
+    // Bug found 2026-08-09: some handover kinds (PersonaBuild) use
+    // job_id as the deliverable's own wiki slug, and the completing
+    // agent writes the real multi-file content directly to
+    // `wiki/<job_id>.md` (+ section files) *before* calling
+    // complete-handover -- that's the documented output-format contract
+    // for that kind. Overwriting it here with `result` (just a one-line
+    // completion summary) destroyed real content. If a wiki file for
+    // this job_id already exists, treat that as evidence the deliverable
+    // was already written directly: index off its actual content
+    // instead of clobbering it with the summary string. Only fall back
+    // to writing `result` as the wiki file when nothing exists yet --
+    // the normal Extraction/Curation case, unaffected by this fix.
+    let wiki_path = paths.wiki.join(format!("{job_id}.md"));
+    let summary = if wiki_path.exists() {
+        let existing = fs::read_to_string(&wiki_path)?;
+        bank::summarize(&existing)
+    } else {
+        wiki::write_named(&paths.wiki, job_id, result)?;
+        bank::summarize(result)
+    };
     bank::append_index_entry(&paths.index, job_id, &summary)?;
 
     let pending_path = paths.pending.join(format!("{job_id}.md"));
@@ -521,6 +539,63 @@ mod tests {
         let data_root = tempfile::tempdir().unwrap();
         let paths = bank::paths_for(data_root.path(), "test-bank");
         (data_root, paths)
+    }
+
+    /// Bug found 2026-08-09 during persona reingestion: `job_id` for a
+    /// PersonaBuild handover is the persona's own slug (e.g.
+    /// "andrej-karpathy"), and the completing agent writes the real
+    /// multi-file wiki deliverable directly to `wiki/<slug>.md` (+
+    /// section files) *before* calling complete-handover -- per
+    /// PersonaBuild's own output-format contract. `complete()` must not
+    /// then blindly overwrite that file with the one-line `result`
+    /// summary string; it clobbered a carefully-written index page with
+    /// "Built full indexed persona wiki..." and had to be hand-restored.
+    #[test]
+    fn complete_does_not_clobber_a_wiki_file_the_agent_already_wrote_for_this_job_id() {
+        let (_data_root, paths) = test_paths();
+        let real_content = "# Andrej Karpathy\n\nThe actual synthesized index page content.";
+        fs::create_dir_all(&paths.wiki).unwrap();
+        fs::write(paths.wiki.join("andrej-karpathy.md"), real_content).unwrap();
+
+        complete(
+            &paths,
+            "andrej-karpathy",
+            "Built full indexed persona wiki from 13 sources",
+        )
+        .unwrap();
+
+        let on_disk = fs::read_to_string(paths.wiki.join("andrej-karpathy.md")).unwrap();
+        assert_eq!(
+            on_disk, real_content,
+            "complete() must not overwrite a wiki file the agent already wrote"
+        );
+    }
+
+    /// The normal case (no pre-existing wiki file for this job_id, e.g.
+    /// Extraction/Curation kinds) is unaffected: `result` is still what
+    /// gets written and indexed.
+    #[test]
+    fn complete_still_writes_result_as_the_wiki_file_when_none_exists_yet() {
+        let (_data_root, paths) = test_paths();
+        complete(&paths, "some-extraction-job", "the extracted fact").unwrap();
+
+        let on_disk = fs::read_to_string(paths.wiki.join("some-extraction-job.md")).unwrap();
+        assert_eq!(on_disk, "the extracted fact");
+    }
+
+    /// Either way, the pending marker is still cleared -- the clobbering
+    /// bug only affected wiki content, not job completion itself.
+    #[test]
+    fn complete_removes_the_pending_marker_whether_or_not_a_wiki_file_pre_existed() {
+        let (_data_root, paths) = test_paths();
+        fs::create_dir_all(&paths.pending).unwrap();
+        fs::write(paths.pending.join("andrej-karpathy.md"), "pending marker").unwrap();
+        fs::create_dir_all(&paths.wiki).unwrap();
+        fs::write(paths.wiki.join("andrej-karpathy.md"), "real content").unwrap();
+
+        complete(&paths, "andrej-karpathy", "summary").unwrap();
+
+        assert!(!paths.pending.join("andrej-karpathy.md").exists());
     }
 
     #[test]
