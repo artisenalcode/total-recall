@@ -9,6 +9,7 @@
 //! `/advice`) needs no changes to read the resulting raw files.
 
 use crate::atomic;
+use crate::ingest;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,6 +18,183 @@ use std::process::Command;
 pub struct VideoTarget {
     pub id: String,
     pub title: String,
+}
+
+/// Every `--session` source (ADR-0007) stages into this fixed bank,
+/// regardless of the session's own recorded cwd or `trm`'s invocation
+/// cwd/`-p` — the one source type in this pipeline where "whatever bank
+/// you're standing in" is actively wrong (a pattern surfaced in a
+/// squishi session is about the user, not squishi). Hardcoded for now,
+/// not user-configurable — fine for a single-user tool.
+pub const SELF_PERSONA_BANK: &str = "self";
+
+/// squishi's own `--session-digest` only reads plain files — no gzip
+/// awareness — so a `sessions/<id>.jsonl.gz` archive (ADR-0006) needs
+/// decompressing to a real file first. A plain `.jsonl` source is
+/// returned unchanged: no copy, `work_dir` untouched, nothing for the
+/// caller to clean up.
+///
+/// For a `.gz` source, the returned path is a freshly-created, uniquely-
+/// named temp file under `work_dir` (pid+nanos in the name, same
+/// uniqueness discipline `atomic::write`'s own tmp files use) — the
+/// caller owns it and must remove it after use (compare the returned
+/// path against `source` to tell the two cases apart). No tmp-then-
+/// rename dance is needed here the way `atomic::write` needs one: the
+/// output IS a disposable temp file, not an overwrite of a stable path,
+/// so a write that fails partway just orphans a filename nothing will
+/// ever read again (unique per call) — it can never be mistaken for real
+/// input on a later call. The orphan is still removed on error, though,
+/// rather than left for a human to find later.
+pub fn read_transcript_path(source: &Path, work_dir: &Path) -> Result<PathBuf, String> {
+    if source.extension().and_then(|e| e.to_str()) != Some("gz") {
+        return Ok(source.to_path_buf());
+    }
+
+    let compressed =
+        std::fs::read(source).map_err(|e| format!("failed to read {}: {e}", source.display()))?;
+    let mut decoder = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut decompressed = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut decompressed)
+        .map_err(|e| format!("failed to decompress {}: {e}", source.display()))?;
+
+    std::fs::create_dir_all(work_dir).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    let tmp_path = work_dir.join(format!(".{stem}.tmp-{}-{}", std::process::id(), nanos));
+
+    if let Err(e) = std::fs::write(&tmp_path, &decompressed) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to write decompressed {}: {e}",
+            source.display()
+        ));
+    }
+    Ok(tmp_path)
+}
+
+/// Fetch+write raw session-transcript files for every `--session` source
+/// (ADR-0007), into `<bank>/raw/<slug>/` — same tier and same per-item
+/// resilience posture as `ingest_videos` (one bad transcript doesn't
+/// abort the batch; only `Err` outright when every path failed).
+///
+/// **No squishi dedup-batch sidecar here**, unlike
+/// `ingest_videos`/`ingest_wikipedia_pages`/`ingest_git_commits` — those
+/// write *raw, uncompressed* source text and get deduped separately for
+/// sub-agent traceability. A session digest is already
+/// squishi-compressed (`--session-digest` runs its own internal `route()`
+/// pass before returning `content`), so a second dedup pass over the
+/// same content already-deduped wouldn't be a traceability aid, just
+/// redundant work. Deliberate, not a missed step.
+///
+/// **No resumability skip** either, unlike `ingest_videos` (which skips
+/// already-fetched videos to avoid re-hitting network/rate limits) —
+/// digesting a local transcript has no such cost, so re-running just
+/// re-digests. Revisit only if a future bulk mode makes that wasteful at
+/// scale (explicitly deferred, ADR-0007 Decision 3).
+pub fn ingest_sessions(
+    raw_dir: &Path,
+    person: &str,
+    slug: &str,
+    session_paths: &[PathBuf],
+    ingested_date: &str,
+) -> Result<(Vec<PathBuf>, FetchFailures), String> {
+    let person_dir = raw_dir.join(slug);
+    std::fs::create_dir_all(&person_dir).map_err(|e| e.to_string())?;
+
+    let mut written = Vec::with_capacity(session_paths.len());
+    let mut failures: FetchFailures = Vec::new();
+
+    for source_path in session_paths {
+        let label = source_path.display().to_string();
+
+        let digest_path = match read_transcript_path(source_path, &person_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                failures.push((label, e));
+                continue;
+            }
+        };
+        let is_temp = &digest_path != source_path;
+
+        let digest_result = ingest::run_squishi_session_digest(&digest_path);
+        if is_temp {
+            let _ = std::fs::remove_file(&digest_path);
+        }
+
+        let digest = match digest_result {
+            Ok(d) if d.content.trim().is_empty() => {
+                failures.push((label, "nothing to digest (empty session)".to_string()));
+                continue;
+            }
+            Ok(d) => d,
+            Err(e) => {
+                failures.push((label, e));
+                continue;
+            }
+        };
+
+        // Falls back to a slug of the source path only in the
+        // (defensive, not expected in practice) case squishi's digest
+        // came back with no session_id at all.
+        let session_id = digest.session_id.clone().unwrap_or_else(|| slugify(&label));
+        let md = build_session_raw_md(person, slug, &digest, source_path, ingested_date);
+        let file_path = person_dir.join(format!("session-{session_id}.md"));
+        if let Err(e) = atomic::write(&file_path, &md) {
+            failures.push((label, e.to_string()));
+            continue;
+        }
+        written.push(file_path);
+    }
+
+    if written.is_empty() {
+        let summary = failures
+            .iter()
+            .map(|(id, e)| format!("{id}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("every session failed to ingest: {summary}"));
+    }
+
+    Ok((written, failures))
+}
+
+/// Same frontmatter shape family as `build_wikipedia_raw_md`/
+/// `build_git_commits_raw_md`, for a Claude Code session-transcript
+/// source (ADR-0007). `session_cwd` falls back to `"unknown"` the same
+/// way `ingest::build_reason` does, for a digest whose transcript never
+/// recorded a `cwd` (defensive — real transcripts always have one, but
+/// the field is `Option` on `SessionDigest`).
+pub fn build_session_raw_md(
+    person: &str,
+    slug: &str,
+    digest: &ingest::SessionDigest,
+    source_path: &Path,
+    ingested_date: &str,
+) -> String {
+    let session_id = digest.session_id.as_deref().unwrap_or("unknown");
+    let session_cwd = digest.cwd.as_deref().unwrap_or("unknown");
+    let word_count = digest.content.split_whitespace().count();
+    format!(
+        "---\n\
+         source: {source}\n\
+         person: {person}\n\
+         person_slug: {slug}\n\
+         type: claude-code-session\n\
+         session_id: {session_id}\n\
+         session_cwd: {session_cwd}\n\
+         ingested: {ingested_date}\n\
+         word_count: {word_count}\n\
+         ---\n\n\
+         {content}\n",
+        source = source_path.display(),
+        content = digest.content,
+    )
 }
 
 /// GitHub's own stable "latest" release-asset redirect — no scraping,
@@ -857,6 +1035,197 @@ pub fn dedup_raw_files(raw_dir: &Path, slug: &str, force: bool) -> Result<usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- read_transcript_path: real fixtures ---
+
+    #[test]
+    fn plain_jsonl_source_is_returned_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("sess.jsonl");
+        std::fs::write(&source, "{}\n").unwrap();
+        let work_dir = tmp.path().join("work");
+
+        let result = read_transcript_path(&source, &work_dir).unwrap();
+        assert_eq!(result, source);
+        assert!(
+            !work_dir.exists(),
+            "work_dir should be untouched for a plain source"
+        );
+    }
+
+    #[test]
+    fn gzip_source_decompresses_to_a_real_temp_file_in_work_dir() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let original = "line one\nline two\nline three\n".repeat(20);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(original.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let source = tmp.path().join("sess-1.jsonl.gz");
+        std::fs::write(&source, &compressed).unwrap();
+        let work_dir = tmp.path().join("work");
+
+        let result = read_transcript_path(&source, &work_dir).unwrap();
+        assert_ne!(result, source, "a gz source must produce a fresh temp path");
+        assert!(result.starts_with(&work_dir));
+        assert_eq!(std::fs::read_to_string(&result).unwrap(), original);
+    }
+
+    // --- build_session_raw_md: pure ---
+
+    #[test]
+    fn build_session_raw_md_matches_the_frontmatter_shape() {
+        let digest = ingest::SessionDigest {
+            content: "USER: a real question\n\nASSISTANT: a real answer".to_string(),
+            session_id: Some("sess-abc123".to_string()),
+            cwd: Some("/home/alvin/Code/_labs/squishi".to_string()),
+            turn_count: 2,
+        };
+        let md = build_session_raw_md(
+            "Alvin Tolentino",
+            "alvin",
+            &digest,
+            Path::new("/home/alvin/.claude/projects/x/sess-abc123.jsonl"),
+            "2026-08-09",
+        );
+        assert!(md.starts_with("---\nsource: /home/alvin/.claude/projects/x/sess-abc123.jsonl\n"));
+        assert!(md.contains("person: Alvin Tolentino\n"));
+        assert!(md.contains("person_slug: alvin\n"));
+        assert!(md.contains("type: claude-code-session\n"));
+        assert!(md.contains("session_id: sess-abc123\n"));
+        assert!(md.contains("session_cwd: /home/alvin/Code/_labs/squishi\n"));
+        assert!(md.ends_with("USER: a real question\n\nASSISTANT: a real answer\n"));
+    }
+
+    #[test]
+    fn build_session_raw_md_falls_back_to_unknown_for_missing_meta() {
+        let digest = ingest::SessionDigest {
+            content: "USER: content with no meta".to_string(),
+            session_id: None,
+            cwd: None,
+            turn_count: 1,
+        };
+        let md = build_session_raw_md(
+            "Alvin Tolentino",
+            "alvin",
+            &digest,
+            Path::new("/some/path.jsonl"),
+            "2026-08-09",
+        );
+        assert!(md.contains("session_id: unknown\n"));
+        assert!(md.contains("session_cwd: unknown\n"));
+    }
+
+    // --- ingest_sessions: real squishi subprocess ---
+
+    /// Doesn't need squishi truly installed to be meaningful: whether the
+    /// binary is missing (spawn itself fails) or present-but-fed-a-
+    /// nonexistent-path (squishi's own file read fails), both surface as
+    /// `Err` from `run_squishi_session_digest` -- exactly what this test
+    /// asserts, so it runs unconditionally rather than joining the
+    /// `#[ignore]`d real-squishi tests below.
+    #[test]
+    fn ingest_sessions_errors_when_every_path_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = vec![
+            tmp.path().join("does-not-exist-1.jsonl"),
+            tmp.path().join("does-not-exist-2.jsonl"),
+        ];
+        let result = ingest_sessions(tmp.path(), "Alvin Tolentino", "alvin", &paths, "2026-08-09");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore] // requires `squishi` installed on PATH (real subprocess)
+    fn ingest_sessions_digests_a_real_plain_and_gzip_transcript() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_dir = tmp.path().join("raw");
+
+        let user_line = |session_id: &str| {
+            format!(
+                r#"{{"type":"user","sessionId":"{session_id}","cwd":"/repo","timestamp":"t1","message":{{"role":"user","content":[{{"type":"text","text":"a real question worth digesting"}}]}}}}"#
+            )
+        };
+
+        let plain_path = tmp.path().join("sess-plain.jsonl");
+        std::fs::write(&plain_path, user_line("sess-plain")).unwrap();
+
+        let gz_path = tmp.path().join("sess-gz.jsonl.gz");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(user_line("sess-gz").as_bytes()).unwrap();
+        std::fs::write(&gz_path, encoder.finish().unwrap()).unwrap();
+
+        let (written, failures) = ingest_sessions(
+            &raw_dir,
+            "Alvin Tolentino",
+            "alvin",
+            &[plain_path, gz_path],
+            "2026-08-09",
+        )
+        .expect("both sources should succeed");
+
+        assert!(
+            failures.is_empty(),
+            "expected no failures, got: {failures:?}"
+        );
+        assert_eq!(written.len(), 2);
+        assert!(written.iter().any(|p| p.ends_with("session-sess-plain.md")));
+        assert!(written.iter().any(|p| p.ends_with("session-sess-gz.md")));
+
+        let plain_content = std::fs::read_to_string(&written[0]).unwrap();
+        assert!(plain_content.contains("type: claude-code-session\n"));
+
+        // The gz source's decompressed temp file must not linger in
+        // raw_dir/alvin/ once digesting is done.
+        let leftovers: Vec<_> = std::fs::read_dir(raw_dir.join("alvin"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "expected no leftover temp files");
+    }
+
+    #[test]
+    #[ignore] // requires `squishi` installed on PATH (real subprocess)
+    fn ingest_sessions_is_resilient_to_one_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_dir = tmp.path().join("raw");
+
+        let real_path = tmp.path().join("sess-real.jsonl");
+        std::fs::write(
+            &real_path,
+            r#"{"type":"user","sessionId":"sess-real","cwd":"/repo","timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"a real question"}]}}"#,
+        )
+        .unwrap();
+        let missing_path = tmp.path().join("does-not-exist.jsonl");
+
+        let (written, failures) = ingest_sessions(
+            &raw_dir,
+            "Alvin Tolentino",
+            "alvin",
+            &[real_path, missing_path],
+            "2026-08-09",
+        )
+        .expect("partial success should be Ok, not Err");
+
+        assert_eq!(written.len(), 1);
+        assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
+    fn corrupt_gzip_source_returns_an_error_not_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("corrupt.jsonl.gz");
+        std::fs::write(&source, b"not actually gzip data").unwrap();
+        let work_dir = tmp.path().join("work");
+
+        let result = read_transcript_path(&source, &work_dir);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn clean_vtt_strips_structure_and_dedupes_rolling_captions() {

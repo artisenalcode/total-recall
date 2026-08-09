@@ -64,6 +64,15 @@ pub struct HandoverTask {
     /// sub-agent knows it's judging an unsplit blob on purpose, not by
     /// silent degradation.
     pub split_failure: Option<String>,
+    /// `PersonaBuild` only (ADR-0007): true when the persona being built
+    /// is the user's OWN self-persona from their real session
+    /// transcripts, not a third-party advisor from public-record
+    /// sources. Swaps `PERSONA_BUILD_CRITERIA` for
+    /// `SELF_PERSONA_BUILD_CRITERIA` in `as_prompt()` — criterion #3's
+    /// "personally-supplied relational layer ONLY if the requester
+    /// actually knows this person" framing is backwards when the subject
+    /// IS the requester.
+    pub self_build: bool,
 }
 
 impl HandoverTask {
@@ -80,6 +89,7 @@ impl HandoverTask {
             source: source.into(),
             candidate_concepts: Vec::new(),
             split_failure: None,
+            self_build: false,
         }
     }
 
@@ -96,6 +106,13 @@ impl HandoverTask {
     /// simply not calling `with_candidate_concepts` at all.
     pub fn with_split_failure(mut self, reason: impl Into<String>) -> Self {
         self.split_failure = Some(reason.into());
+        self
+    }
+
+    /// Mark this `PersonaBuild` as the user's own self-persona — see
+    /// `self_build`'s doc comment.
+    pub fn with_self_persona_build(mut self) -> Self {
+        self.self_build = true;
         self
     }
 
@@ -125,10 +142,11 @@ impl HandoverTask {
             ),
             None => String::new(),
         };
-        let persona_instructions = if self.kind == HandoverKind::PersonaBuild {
-            PERSONA_BUILD_CRITERIA
-        } else {
-            ""
+        let persona_instructions = match (self.kind == HandoverKind::PersonaBuild, self.self_build)
+        {
+            (true, true) => SELF_PERSONA_BUILD_CRITERIA,
+            (true, false) => PERSONA_BUILD_CRITERIA,
+            (false, _) => "",
         };
         let candidates = if self.candidate_concepts.is_empty() {
             String::new()
@@ -222,6 +240,61 @@ index/guardrail split is the part that matters, not the file count.\n\n\
 When done: write all of the above to the resolved bank's wiki tier, then `trm complete-handover \
 <job-id> \"<summary>\"`.";
 
+/// Same criteria and output shape as `PERSONA_BUILD_CRITERIA`, with one
+/// real difference (ADR-0007): this is the user's OWN self-persona, built
+/// from their real Claude Code session transcripts — not a third-party
+/// advisor being observed from public-record sources. Criterion #3's
+/// "personally-supplied relational layer ONLY if the requester actually
+/// knows this person" framing is backwards here — the subject IS the
+/// requester, so there's no relational layer to a third party to
+/// (not-)fabricate; the whole corpus is already first-person.
+const SELF_PERSONA_BUILD_CRITERIA: &str = "\n\n\
+PERSONA BUILD (SELF) — synthesize the source session transcripts above into an INDEXED \
+persona wiki for the USER'S OWN self-persona: an index file plus one file per section (see \
+Output format below), not one flat page. This is not a third party being observed — every \
+source here is the user's own real words/decisions from their own sessions. Read all sources \
+together before writing; this is one holistic authoring task, not a per-sentence judgment \
+(deliberately not concept-split — see HandoverKind::PersonaBuild).\n\n\
+Capture criteria (co-developed with Dr. Roy Sugarman, a real clinical neuropsychologist \
+advisor in this store; item #3 adapted for a self-persona, see note above):\n\
+1. Process/mechanism, not trait labels — how they think, not a score.\n\
+2. Values, ranked, evidenced by what they return to unprompted across independent sources.\n\
+3. No third-party relational layer applies (the subject IS the requester) — instead, note \
+where the corpus itself shows self-awareness or self-correction (the user catching their own \
+mistake, revising a stated preference) as first-person signal, not fabricated.\n\
+4. An explicit, permanent caveat that text cannot carry warmth/relational field.\n\
+5. Recurring stories as the actual retrieval unit, paired with the concept each illustrates.\n\
+6. Provenance/confidence tagged per claim — FOUR buckets, not three: corpus-evidenced / \
+user-supplied / inferred / externally disputed (a claim can be sincerely held and \
+corpus-evidenced and still be actively contested by domain experts — tag that separately).\n\
+7. An explicit scope boundary — what they're actually credentialed/practiced in vs. what \
+they merely commented on once, AND distinguish self-disclosed limitations from claims \
+inside their stated expertise that others have actually disputed.\n\n\
+Output format — write these files directly, don't stage a flat page and split it later:\n\
+- `wiki/<slug>.md` — the INDEX. The only file that loads by default, so keep it small: a \
+one-paragraph identity line; GUARDRAILS inline (the warmth caveat from #4, the scope boundary \
+from #7); the Recurring-stories retrieval table from #5; and a routing table naming which \
+section file below answers which kind of question. Guardrails stay inline because skipping \
+them on an unrelated query is a correctness risk, not just an efficiency loss — everything \
+else below is indexed out because it only matters when the question is actually about that.\n\
+- `wiki/<slug>-bio.md` — biography/background.\n\
+- `wiki/<slug>-values.md` — item #2, in full.\n\
+- `wiki/<slug>-mechanism.md` — item #1, in full ('how they reason, not conclusions').\n\
+- `wiki/<slug>-frameworks.md` — named frameworks/models, one-line definition each, pointing \
+into the enrichment stories from #5 for worked examples.\n\
+- `wiki/<slug>-stances.md` — positions/opinions AND why they hold them.\n\
+- `wiki/<slug>-voice.md` — voice/style markers for emulation.\n\
+- `wiki/<slug>-provenance.md` — corpus mechanics: word/lexicon counts, source list, build notes, \
+the provenance tags from #6. Never loaded by default; pulled only for a corpus-mechanics \
+question, not a substantive one.\n\
+- `wiki/<slug>-enrichment/NN-<story-slug>.md` — one file per recurring story from #5, each with \
+a `concept:` frontmatter tag matching its row in the index's retrieval table.\n\n\
+If the corpus is genuinely small (a couple of sources, a handful of stories), collapse sparse \
+section files together rather than forcing every one into existence for its own sake — the \
+index/guardrail split is the part that matters, not the file count.\n\n\
+When done: write all of the above to the resolved bank's wiki tier, then `trm complete-handover \
+<job-id> \"<summary>\"`.";
+
 /// Stage raw content for extraction: write it into the raw tier, then
 /// drop a pending marker (the rendered prompt) so `list_pending` and a
 /// future harness session can find it. `source` labels provenance —
@@ -277,13 +350,17 @@ pub fn stage_persona_sources(
     source_paths: Vec<PathBuf>,
     description: &str,
     source: &str,
+    self_build: bool,
 ) -> io::Result<String> {
-    let task = HandoverTask::new(
+    let mut task = HandoverTask::new(
         HandoverKind::PersonaBuild,
         description,
         source_paths,
         source,
     );
+    if self_build {
+        task = task.with_self_persona_build();
+    }
     atomic::write(&paths.pending.join(format!("{slug}.md")), &task.as_prompt())?;
     Ok(slug.to_string())
 }
@@ -478,6 +555,7 @@ mod tests {
             source_paths.clone(),
             "Build a persona wiki page for Jane Doe from 2 raw video transcript(s)",
             "direct",
+            false,
         )
         .unwrap();
 
@@ -493,6 +571,34 @@ mod tests {
         // pointer to go re-derive them.
         assert!(marker.contains("Values, ranked, evidenced by what they return to unprompted"));
         assert!(marker.contains("externally disputed"));
+        // Not the self-build variant -- ADR-0007's framing must not leak
+        // into a normal advisor build.
+        assert!(!marker.contains("PERSONA BUILD (SELF)"));
+    }
+
+    /// ADR-0007: a self-persona build renders the self-framed criteria
+    /// instead of the third-party-advisor framing, and never the reverse.
+    #[test]
+    fn stage_persona_sources_self_build_renders_the_self_framed_criteria() {
+        let (_data_root, paths) = test_paths();
+        let source_paths = vec![paths.raw.join("alvin/session-sess-1.md")];
+        let job_id = stage_persona_sources(
+            &paths,
+            "alvin",
+            source_paths,
+            "Build a self-persona wiki page for Alvin Tolentino from 1 raw session source(s)",
+            "direct",
+            true,
+        )
+        .unwrap();
+
+        let marker = fs::read_to_string(paths.pending.join(format!("{job_id}.md"))).unwrap();
+        assert!(marker.contains("PERSONA BUILD (SELF)"));
+        assert!(marker.contains("No third-party relational layer applies"));
+        // The normal advisor framing this replaces must NOT also be present.
+        assert!(!marker.contains(
+            "A real personally-supplied relational layer ONLY if the requester actually knows"
+        ));
     }
 
     /// Per ADR-0004: bulk/multi-concept content staged for a handover

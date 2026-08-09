@@ -515,3 +515,114 @@ fn ingest_sessions_all_archives_only_the_one_eligible_transcript() {
         archived_gz.display()
     );
 }
+
+/// ADR-0007: `--session` always stages into the fixed `self` bank,
+/// regardless of the invocation cwd (no `.git`/`.trm-bank` at all here --
+/// would resolve to `global` if normal cwd resolution applied) or an
+/// explicit `-p` passed alongside it.
+#[test]
+fn ingest_persona_session_source_stages_into_the_fixed_self_bank() {
+    if !squishi_on_path() {
+        eprintln!(
+            "skipping ingest_persona_session_source_stages_into_the_fixed_self_bank: \
+             squishi not on PATH (see squishi_on_path's doc comment)"
+        );
+        return;
+    }
+    let data_root = scratch_data_root();
+    let invocation_cwd = tempfile::tempdir().expect("failed to create invocation cwd dir");
+
+    let session_path = tempfile::tempdir()
+        .expect("failed to create session dir")
+        .keep()
+        .join("sess-self-1.jsonl");
+    std::fs::write(
+        &session_path,
+        r#"{"type":"user","sessionId":"sess-self-1","cwd":"/repo","timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"a real question worth digesting"}]}}"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_trm"));
+    cmd.args([
+        "-p",
+        "explicitly-wrong-bank",
+        "ingest-persona",
+        "--person",
+        "Alvin Tolentino",
+        "--slug",
+        "alvin",
+        "--session",
+        session_path.to_str().unwrap(),
+    ])
+    .env("MF_DATA_ROOT", data_root.path())
+    .current_dir(invocation_cwd.path());
+    let output = cmd.output().expect("failed to run trm binary");
+
+    assert!(
+        output.status.success(),
+        "trm ingest-persona --session exited non-zero: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("staged:"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("-p/--bank is ignored"),
+        "expected the informational note about -p being ignored"
+    );
+
+    let self_bank_raw = data_root
+        .path()
+        .join("banks")
+        .join("self")
+        .join("raw")
+        .join("alvin")
+        .join("session-sess-self-1.md");
+    assert!(
+        self_bank_raw.exists(),
+        "expected {} to exist",
+        self_bank_raw.display()
+    );
+
+    let wrong_bank = data_root.path().join("banks").join("explicitly-wrong-bank");
+    assert!(
+        !wrong_bank.exists(),
+        "the explicitly-passed -p bank must never be touched by a --session source"
+    );
+}
+
+/// `--session` cannot be combined with the advisor-shaped sources
+/// (ADR-0007 Decision 3) -- must fail before touching either source, not
+/// partially stage one and then error.
+#[test]
+fn ingest_persona_session_cannot_mix_with_video_source() {
+    let data_root = scratch_data_root();
+    let output = run_trm(
+        &[
+            "ingest-persona",
+            "--person",
+            "Someone",
+            "--slug",
+            "someone",
+            "--session",
+            "/tmp/irrelevant-does-not-need-to-exist.jsonl",
+            "--video",
+            "abc123|A Title",
+        ],
+        data_root.path(),
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot be combined"),
+        "expected the mutual-exclusion error message, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Confirm this really failed before doing any work -- no bank
+    // directory at all should exist for either "self" or the normal
+    // cwd-resolved bank.
+    let banks_dir = data_root.path().join("banks");
+    assert!(
+        !banks_dir.exists() || std::fs::read_dir(&banks_dir).unwrap().next().is_none(),
+        "no bank should have been created for a rejected mixed-source call"
+    );
+}
