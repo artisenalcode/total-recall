@@ -268,6 +268,70 @@ fn download_yt_dlp(dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Enumerate up to `max` of a channel's most-recent videos as
+/// `VideoTarget`s, via `yt-dlp --flat-playlist` (lists videos without
+/// downloading anything, including captions -- a separate, much
+/// cheaper network operation than `fetch_captions`). Fills the real gap
+/// found 2026-08-09 reingesting a 23-person batch: `--video` is
+/// explicitly hand-picked-only (see its CLI doc comment), so before
+/// this there was no way to point `ingest-persona` at a channel URL
+/// directly -- callers had to shell out to `yt-dlp --flat-playlist`
+/// themselves and translate the output into a wall of `--video` flags.
+///
+/// `%(id)s|%(title)s` is the same `id|title` shape `--video` already
+/// expects, so enumerated targets merge into the same `Vec<VideoTarget>`
+/// pipeline `fetch_captions`/`ingest_videos` already handle -- no new
+/// code path downstream, just a new way to populate the list.
+///
+/// A real video ID can start with `-` (found 2026-08-09: bashbunni's
+/// most recent upload at the time was `-EMKMPxJrWY`) -- parsing here
+/// splits on the first `|`, so a leading `-` in the id half is just
+/// data, never mistaken for a flag the way it would be if this were
+/// naively re-serialized into space-separated CLI args downstream (see
+/// `--video`'s `allow_hyphen_values` fix in main.rs for the CLI-level
+/// half of this same bug class).
+pub fn enumerate_channel_videos(
+    yt_dlp_bin: &Path,
+    channel_url: &str,
+    max: usize,
+) -> Result<Vec<VideoTarget>, String> {
+    let output = Command::new(yt_dlp_bin)
+        .args(["--flat-playlist", "--playlist-end"])
+        .arg(max.to_string())
+        .args(["--print", "%(id)s|%(title)s"])
+        .arg(channel_url)
+        .output()
+        .map_err(|e| format!("failed to run {}: {e}", yt_dlp_bin.display()))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "yt-dlp channel enumeration failed for {channel_url:?}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut targets = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.split_once('|') {
+            Some((id, title)) => targets.push(VideoTarget {
+                id: id.to_string(),
+                title: title.to_string(),
+            }),
+            // A title itself could theoretically contain no pipe issue,
+            // but a line with no pipe at all means yt-dlp's own output
+            // format didn't match what was requested -- skip rather
+            // than fail the whole channel over one malformed line.
+            None => continue,
+        }
+    }
+    Ok(targets)
+}
+
 /// Strip VTT structure (WEBVTT/Kind/Language headers, timing cue lines,
 /// inline `<...>` tags), collapse consecutive rolling-caption duplicate
 /// lines, and decode the handful of HTML entities real auto-captions
@@ -636,6 +700,260 @@ fn render_commits(mut commits: Vec<Commit>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Fetches a URL's agent-readable text via the locally installed
+/// `agent-browser` CLI (`agent-browser read <url>`) rather than a plain
+/// HTTP GET. Real browser rendering handles JS-heavy pages a static
+/// fetch can't — the exact failure found 2026-08-07 on Roy Sugarman's
+/// own `/media` page, where a static fetch returned nothing because the
+/// embedded video list only exists after JS runs; `agent-browser` (a
+/// real Chrome/Chromium session) was used by hand to work around it that
+/// session. This wires the same tool into the pipeline itself so a
+/// personal-site/blog source doesn't need a human to notice and
+/// intervene. `agent-browser read` already returns cleaned,
+/// markdown-ish text (HTML boilerplate stripped) — no separate
+/// HTML-to-text step needed here.
+pub fn fetch_website(url: &str) -> Result<String, String> {
+    let output = Command::new("agent-browser")
+        .args(["read", url])
+        .output()
+        .map_err(|e| format!("failed to run agent-browser (is it installed on PATH?): {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "agent-browser read failed for {url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.len() < 200 {
+        return Err(format!(
+            "website text too short for {url} ({} bytes) — likely a fetch failure, not real content",
+            text.len()
+        ));
+    }
+    Ok(text)
+}
+
+/// Same frontmatter shape family as `build_wikipedia_raw_md`, for a
+/// personal-site/blog page fetched via `agent-browser`.
+pub fn build_website_raw_md(
+    person: &str,
+    slug: &str,
+    url: &str,
+    text: &str,
+    ingested_date: &str,
+) -> String {
+    let word_count = text.split_whitespace().count();
+    format!(
+        "---\n\
+         source: {url}\n\
+         person: {person}\n\
+         person_slug: {slug}\n\
+         type: website\n\
+         ingested: {ingested_date}\n\
+         word_count: {word_count}\n\
+         ---\n\n\
+         {text}\n"
+    )
+}
+
+/// Fetch+write raw website/blog files, one per URL, into
+/// `<bank>/raw/<slug>/` — same tier, resilience posture (one bad URL
+/// doesn't abort the batch), and best-effort squishi-sidecar treatment
+/// as `ingest_wikipedia_pages`. `restore_punctuation` is always `false`
+/// here, same reasoning as the Wikipedia/git-commit sources: real prose
+/// already has real punctuation by construction, unlike YouTube
+/// auto-captions.
+pub fn ingest_websites(
+    raw_dir: &Path,
+    person: &str,
+    slug: &str,
+    urls: &[String],
+    ingested_date: &str,
+) -> Result<(Vec<PathBuf>, FetchFailures), String> {
+    let person_dir = raw_dir.join(slug);
+    std::fs::create_dir_all(&person_dir).map_err(|e| e.to_string())?;
+
+    let mut written = Vec::with_capacity(urls.len());
+    let mut dedup_items = Vec::with_capacity(urls.len());
+    let mut failures: FetchFailures = Vec::new();
+    for url in urls {
+        let text = match fetch_website(url) {
+            Ok(t) => t,
+            Err(e) => {
+                failures.push((url.clone(), e));
+                continue;
+            }
+        };
+        let md = build_website_raw_md(person, slug, url, &text, ingested_date);
+        let id = slugify(url);
+        let file_path = person_dir.join(format!("website-{id}.md"));
+        if let Err(e) = atomic::write(&file_path, &md) {
+            failures.push((url.clone(), e.to_string()));
+            continue;
+        }
+        written.push(file_path);
+        dedup_items.push((format!("website-{id}"), text, false));
+    }
+
+    if written.is_empty() {
+        let summary = failures
+            .iter()
+            .map(|(id, e)| format!("{id}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("every website failed to fetch: {summary}"));
+    }
+
+    if let Ok(results) = run_squishi_dedup_batch(&dedup_items) {
+        for (id, dedup_json) in results {
+            let sidecar_path = person_dir.join(format!("{id}.dedup.json"));
+            let _ = atomic::write(&sidecar_path, &dedup_json);
+        }
+    }
+    Ok((written, failures))
+}
+
+/// Extracts the `owner/repo` slug from a GitHub URL (with or without a
+/// trailing `.git`/`/`), for `gh api` calls — those address repos by
+/// slug, not clone URL. Returns `None` for a non-GitHub host: issue
+/// search is a GitHub-specific API, unlike `fetch_git_commits` (plain
+/// `git log`, host-agnostic).
+pub fn parse_github_slug(repo_url: &str) -> Option<String> {
+    let trimmed = repo_url.trim_end_matches('/').trim_end_matches(".git");
+    let after_host = trimmed.split("github.com/").nth(1)?;
+    let mut parts = after_host.splitn(3, '/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Fetches issues/PRs authored by `github_users` (real GitHub logins —
+/// a different identifier than `fetch_git_commits`'s email-matched
+/// `--git-author`, since GitHub's issue-search API matches by account,
+/// not commit-trailer email) in `repo_slug`, via `gh api search/issues`
+/// — issue/PR data lives only on GitHub's side, not in `git log`, so a
+/// clone (as `fetch_git_commits` does) can't reach it. Requires `gh`
+/// authenticated on PATH (already a documented environment tool).
+pub fn fetch_git_issues(repo_slug: &str, github_users: &[String]) -> Result<String, String> {
+    if github_users.is_empty() {
+        return Err("fetch_git_issues requires at least one --github-user".to_string());
+    }
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for user in github_users {
+        let query = format!("repo:{repo_slug} author:{user}");
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "search/issues",
+                "-X",
+                "GET",
+                "-f",
+                &format!("q={query}"),
+                "--jq",
+                r#".items[] | [.created_at, .title, (.body // "")] | @tsv"#,
+            ])
+            .output()
+            .map_err(|e| format!("failed to run gh: {e}"))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "gh api search/issues failed for {repo_slug} author:{user}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut fields = line.splitn(3, '\t');
+            let (Some(date), Some(title), Some(body)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            entries.push((date.to_string(), format!("{title}\n{body}")));
+        }
+    }
+
+    if entries.is_empty() {
+        return Err(format!(
+            "no issues/PRs found for github user(s) {github_users:?} in {repo_slug}"
+        ));
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries
+        .into_iter()
+        .map(|(date, body)| format!("On {date}: {body}"))
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+/// Same frontmatter shape family as `build_git_commits_raw_md`, for an
+/// issue/PR-discussion corpus.
+pub fn build_git_issues_raw_md(
+    person: &str,
+    slug: &str,
+    repo_slug: &str,
+    text: &str,
+    ingested_date: &str,
+) -> String {
+    let word_count = text.split_whitespace().count();
+    format!(
+        "---\n\
+         source: https://github.com/{repo_slug}/issues\n\
+         person: {person}\n\
+         person_slug: {slug}\n\
+         type: git-issues\n\
+         ingested: {ingested_date}\n\
+         word_count: {word_count}\n\
+         ---\n\n\
+         # Issues/PRs from {repo_slug}\n\n\
+         {text}\n"
+    )
+}
+
+/// Fetch+write one raw file of issue/PR text for a single repo — same
+/// tier and best-effort squishi-sidecar treatment as `ingest_git_commits`.
+pub fn ingest_git_issues(
+    raw_dir: &Path,
+    person: &str,
+    slug: &str,
+    repo_url: &str,
+    github_users: &[String],
+    ingested_date: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let repo_slug = parse_github_slug(repo_url).ok_or_else(|| {
+        format!(
+            "{repo_url:?} doesn't look like a github.com repo URL — issue search is GitHub-specific"
+        )
+    })?;
+
+    let person_dir = raw_dir.join(slug);
+    std::fs::create_dir_all(&person_dir).map_err(|e| e.to_string())?;
+
+    let text = fetch_git_issues(&repo_slug, github_users)?;
+    let md = build_git_issues_raw_md(person, slug, &repo_slug, &text, ingested_date);
+    let file_name = format!("git-issues-{}.md", slugify(&repo_slug));
+    let file_path = person_dir.join(&file_name);
+    atomic::write(&file_path, &md).map_err(|e| e.to_string())?;
+
+    let dedup_id = slugify(&repo_slug);
+    let dedup_items = vec![(dedup_id.clone(), text, false)];
+    if let Ok(results) = run_squishi_dedup_batch(&dedup_items) {
+        for (_id, dedup_json) in results {
+            let sidecar_path = person_dir.join(format!("git-issues-{dedup_id}.dedup.json"));
+            let _ = atomic::write(&sidecar_path, &dedup_json);
+        }
+    }
+
+    Ok(vec![file_path])
 }
 
 /// Same frontmatter shape family as `build_wikipedia_raw_md`, for a
@@ -1030,6 +1348,73 @@ pub fn dedup_raw_files(raw_dir: &Path, slug: &str, force: bool) -> Result<usize,
         atomic::write(&sidecar_path, dedup_json).map_err(|e| e.to_string())?;
     }
     Ok(results.len())
+}
+
+/// Same threshold `advisory/tools/dedupe_semantic.py` calibrated on real
+/// persona corpora (0.8 = high precision) -- reused as-is, not
+/// recalibrated from nothing. See `crate::concepts` for the algorithm.
+const CONCEPTS_SPLIT_THRESHOLD: f32 = 0.8;
+
+/// Sentence-level concept distillation over whatever raw `.md` files
+/// already exist for `slug` -- the trm-native port of `advisory/tools/
+/// dedupe_semantic.py`, finally wired into the persona pipeline
+/// (`crate::concepts::split` already existed for `handover.rs`'s
+/// candidate-splitting but was never called from here). Complementary
+/// to `dedup_raw_files`, not a replacement: that produces a coarse,
+/// near-full-length punctuation-restored sidecar per file; this
+/// produces a much smaller per-file sidecar of unique-concept
+/// sentences, meant as a distilled synthesis input alongside the raw
+/// transcript -- not judged sentence-by-sentence as a handover
+/// candidate list (see `HandoverKind::PersonaBuild`'s doc comment for
+/// why persona synthesis stays a holistic read, not a per-concept
+/// judgment). Skips a file that already has a `.concepts.json` sidecar
+/// unless `force` is set. Returns how many files were processed.
+pub fn extract_concepts_files(raw_dir: &Path, slug: &str, force: bool) -> Result<usize, String> {
+    let person_dir = raw_dir.join(slug);
+    if !person_dir.is_dir() {
+        return Err(format!(
+            "no raw directory for slug {slug:?}: {}",
+            person_dir.display()
+        ));
+    }
+
+    let mut targets = Vec::new();
+    let entries = std::fs::read_dir(&person_dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let id = name.trim_end_matches(".md");
+        let sidecar_path = person_dir.join(format!("{id}.concepts.json"));
+        if sidecar_path.exists() && !force {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        targets.push((id.to_string(), sidecar_path, strip_frontmatter(&content)));
+    }
+
+    if targets.is_empty() {
+        return Ok(0);
+    }
+
+    // Embedder is loaded once and reused across every file in this
+    // slug -- model load is the expensive part, not the per-file split.
+    let mut embedder = crate::embeddings::Embedder::new(crate::bank::data_root().join("models"))?;
+
+    let mut processed = 0;
+    for (id, sidecar_path, body) in targets {
+        let concepts = crate::concepts::split(&body, &mut embedder, CONCEPTS_SPLIT_THRESHOLD)?;
+        let json = serde_json::json!({ "id": id, "concepts": concepts });
+        let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+        atomic::write(&sidecar_path, &text).map_err(|e| e.to_string())?;
+        processed += 1;
+    }
+    Ok(processed)
 }
 
 #[cfg(test)]
@@ -1485,6 +1870,120 @@ mod tests {
         }
     }
 
+    // --- enumerate_channel_videos: pure parsing + fake-binary tests ---
+
+    /// A fake yt-dlp that just echoes fixed lines to stdout, ignoring its
+    /// arguments -- proves the parsing logic without touching the network.
+    fn seed_fake_yt_dlp_printing(dir: &Path, lines: &[&str]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let stub = dir.join("yt-dlp");
+        let script = format!(
+            "#!/bin/sh\n{}\n",
+            lines
+                .iter()
+                .map(|l| format!("echo '{l}'"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        std::fs::write(&stub, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        stub
+    }
+
+    #[test]
+    fn enumerate_channel_videos_parses_id_title_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = seed_fake_yt_dlp_printing(
+            tmp.path(),
+            &["abc123|First Video", "def456|Second Video: A Subtitle"],
+        );
+        let result = enumerate_channel_videos(&bin, "https://youtube.com/@fake/videos", 50);
+        assert_eq!(
+            result,
+            Ok(vec![
+                VideoTarget {
+                    id: "abc123".to_string(),
+                    title: "First Video".to_string(),
+                },
+                VideoTarget {
+                    id: "def456".to_string(),
+                    title: "Second Video: A Subtitle".to_string(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn enumerate_channel_videos_handles_a_dash_prefixed_id() {
+        // Real bug found 2026-08-09: bashbunni's most recent upload at the
+        // time had the video ID "-EMKMPxJrWY". Splitting on the first '|'
+        // must keep that leading '-' as part of the id, not choke on it.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = seed_fake_yt_dlp_printing(tmp.path(), &["-EMKMPxJrWY|dash prefixed id"]);
+        let result = enumerate_channel_videos(&bin, "https://youtube.com/@fake/videos", 50);
+        assert_eq!(
+            result,
+            Ok(vec![VideoTarget {
+                id: "-EMKMPxJrWY".to_string(),
+                title: "dash prefixed id".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn enumerate_channel_videos_skips_blank_and_malformed_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin =
+            seed_fake_yt_dlp_printing(tmp.path(), &["", "no-pipe-here", "real123|A Real Title"]);
+        let result = enumerate_channel_videos(&bin, "https://youtube.com/@fake/videos", 50);
+        assert_eq!(
+            result,
+            Ok(vec![VideoTarget {
+                id: "real123".to_string(),
+                title: "A Real Title".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn enumerate_channel_videos_on_empty_channel_returns_empty_ok_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = seed_fake_yt_dlp_printing(tmp.path(), &[]);
+        let result = enumerate_channel_videos(&bin, "https://youtube.com/@fake/videos", 50);
+        assert_eq!(result, Ok(Vec::new()));
+    }
+
+    #[test]
+    fn enumerate_channel_videos_surfaces_a_real_error_when_yt_dlp_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_fake_failing_yt_dlp(tmp.path());
+        let bin = tmp.path().join("bin").join("yt-dlp");
+        let result = enumerate_channel_videos(&bin, "https://youtube.com/@fake/videos", 50);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore] // requires network + real yt-dlp on PATH
+    fn enumerate_channel_videos_real_channel_respects_the_max_cap() {
+        let data_root = tempfile::tempdir().unwrap();
+        let yt_dlp = ensure_yt_dlp(data_root.path()).unwrap();
+        // A real, stable, high-upload-volume channel -- if this ever
+        // becomes flaky due to the channel changing, swap the URL, but
+        // the point of this test is exercising the real network path,
+        // not the specific channel.
+        let result =
+            enumerate_channel_videos(&yt_dlp, "https://www.youtube.com/@ippsec", 3).unwrap();
+        assert_eq!(result.len(), 3, "expected exactly 3 videos (the cap)");
+        for v in &result {
+            assert!(!v.id.is_empty());
+            assert!(!v.title.is_empty());
+        }
+    }
+
     #[test]
     fn ingest_videos_returns_an_error_without_touching_the_network_when_yt_dlp_fails() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1586,6 +2085,81 @@ mod tests {
         // would otherwise hang/error in a test environment without it).
         let result = dedup_raw_files(tmp.path(), "has-sidecar", false);
         assert_eq!(result, Ok(0));
+    }
+
+    // --- extract_concepts_files: pure/fast paths, no real embedder call ---
+
+    #[test]
+    fn extract_concepts_files_errors_for_a_missing_slug_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = extract_concepts_files(tmp.path(), "no-such-slug", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_concepts_files_on_an_empty_directory_returns_zero_without_loading_embedder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("empty-slug")).unwrap();
+        let result = extract_concepts_files(tmp.path(), "empty-slug", false);
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn extract_concepts_files_skips_a_file_that_already_has_a_sidecar_unless_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let person_dir = tmp.path().join("has-sidecar");
+        std::fs::create_dir_all(&person_dir).unwrap();
+        std::fs::write(
+            person_dir.join("yt-abc.md"),
+            "---\nsource: x\n---\n\nreal body",
+        )
+        .unwrap();
+        std::fs::write(
+            person_dir.join("yt-abc.concepts.json"),
+            r#"{"already":"there"}"#,
+        )
+        .unwrap();
+
+        // Nothing left to process -> Ok(0), never loads the embedder
+        // (which would otherwise download/init models in a test
+        // environment that shouldn't need them for this path).
+        let result = extract_concepts_files(tmp.path(), "has-sidecar", false);
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    #[ignore] // requires the fastembed model cache (real download on first run)
+    fn extract_concepts_files_writes_a_distilled_sidecar_for_a_real_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let person_dir = tmp.path().join("real-slug");
+        std::fs::create_dir_all(&person_dir).unwrap();
+        let sentence = "I had a client who wanted to lose weight to fit into a wedding dress, \
+                         and context tells the genes what they need to do, because values are \
+                         the load-bearing unit of motivation and autonomy matters more than \
+                         almost anything else in coaching. ";
+        let text: String = std::iter::repeat_n(sentence, 20).collect();
+        std::fs::write(
+            person_dir.join("yt-real.md"),
+            format!("---\nsource: x\n---\n\n{text}"),
+        )
+        .unwrap();
+
+        let count = extract_concepts_files(tmp.path(), "real-slug", false).unwrap();
+        assert_eq!(count, 1);
+
+        let sidecar: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(person_dir.join("yt-real.concepts.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["id"], "yt-real");
+        let concepts = sidecar["concepts"].as_array().unwrap();
+        // 20 exact repeats of one sentence should collapse to far fewer
+        // than 20 -- proves the dedup actually ran, not just a passthrough.
+        assert!(
+            concepts.len() < 5,
+            "expected heavy collapse of 20 identical sentences, got {}",
+            concepts.len()
+        );
     }
 
     // --- strip_frontmatter: pure ---
@@ -1692,5 +2266,132 @@ mod tests {
         .unwrap();
         assert_eq!(yt_json["punctuation_restored"], true);
         assert_eq!(wiki_json["punctuation_restored"], false);
+    }
+
+    // --- build_website_raw_md: pure ---
+
+    #[test]
+    fn build_website_raw_md_matches_the_frontmatter_shape() {
+        let md = build_website_raw_md(
+            "Jane Doe",
+            "jane-doe",
+            "https://example.com/about",
+            "real page text",
+            "2026-08-10",
+        );
+        assert!(md.starts_with("---\nsource: https://example.com/about\n"));
+        assert!(md.contains("type: website\n"));
+        assert!(md.contains("word_count: 3\n"));
+        assert!(md.ends_with("real page text\n"));
+    }
+
+    // --- fetch_website: real subprocess (agent-browser), #[ignore]d ---
+
+    #[test]
+    #[ignore] // requires `agent-browser` installed on PATH (real subprocess + browser)
+    fn fetch_website_returns_real_agent_readable_text() {
+        let text = fetch_website("https://example.com").unwrap();
+        assert!(text.to_lowercase().contains("example"));
+    }
+
+    #[test]
+    #[ignore] // requires `agent-browser` installed on PATH (real subprocess + browser)
+    fn fetch_website_errors_on_a_real_nonexistent_host() {
+        let result = fetch_website("https://this-host-genuinely-does-not-exist-12345.invalid");
+        assert!(result.is_err());
+    }
+
+    // --- ingest_websites: real subprocess, #[ignore]d ---
+
+    #[test]
+    #[ignore] // requires `agent-browser` installed on PATH (real subprocess + browser)
+    fn ingest_websites_is_resilient_to_one_bad_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (written, failures) = ingest_websites(
+            tmp.path(),
+            "Jane Doe",
+            "jane-doe",
+            &[
+                "https://example.com".to_string(),
+                "https://this-host-genuinely-does-not-exist-12345.invalid".to_string(),
+            ],
+            "2026-08-10",
+        )
+        .expect("partial success should be Ok, not Err");
+        assert_eq!(written.len(), 1);
+        assert_eq!(failures.len(), 1);
+    }
+
+    // --- parse_github_slug: pure ---
+
+    #[test]
+    fn parse_github_slug_extracts_owner_repo_from_a_plain_url() {
+        assert_eq!(
+            parse_github_slug("https://github.com/bcherny/json-schema-to-typescript"),
+            Some("bcherny/json-schema-to-typescript".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_strips_trailing_dot_git_and_slash() {
+        assert_eq!(
+            parse_github_slug("https://github.com/octocat/Hello-World.git/"),
+            Some("octocat/Hello-World".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_returns_none_for_a_non_github_host() {
+        assert_eq!(
+            parse_github_slug("https://gitlab.com/someone/somerepo"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_returns_none_for_a_bare_github_root() {
+        assert_eq!(parse_github_slug("https://github.com/"), None);
+        assert_eq!(parse_github_slug("https://github.com/justowner"), None);
+    }
+
+    // --- build_git_issues_raw_md: pure ---
+
+    #[test]
+    fn build_git_issues_raw_md_matches_the_frontmatter_shape() {
+        let md = build_git_issues_raw_md(
+            "Jane Doe",
+            "jane-doe",
+            "example/repo",
+            "On 2026-01-01: A real issue title.",
+            "2026-08-10",
+        );
+        assert!(md.starts_with("---\nsource: https://github.com/example/repo/issues\n"));
+        assert!(md.contains("type: git-issues\n"));
+        assert!(md.contains("# Issues/PRs from example/repo\n"));
+    }
+
+    // --- fetch_git_issues: real subprocess (gh), #[ignore]d ---
+
+    #[test]
+    #[ignore] // requires `gh` authenticated on PATH (real subprocess + network)
+    fn fetch_git_issues_returns_real_issues_for_a_real_author() {
+        // GitHub's own public demo repo -- same choice
+        // `fetch_git_commits_returns_real_commit_messages_for_a_real_author`
+        // makes, for the same reason (small, stable, genuinely public).
+        let text = fetch_git_issues("octocat/Hello-World", &["octocat".to_string()]);
+        // octocat/Hello-World may genuinely have zero issues authored by
+        // octocat specifically -- this asserts the call succeeds
+        // mechanically (real `gh` subprocess, real JSON), not that
+        // results are non-empty.
+        assert!(
+            text.is_ok() || text.as_ref().unwrap_err().contains("no issues/PRs found"),
+            "expected either real results or the documented empty-result error: {text:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_git_issues_errors_with_no_github_users() {
+        let result = fetch_git_issues("example/repo", &[]);
+        assert!(result.is_err());
     }
 }
