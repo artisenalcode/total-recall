@@ -175,13 +175,31 @@ enum Commands {
         #[arg(long)]
         slug: String,
         /// Repeatable: "<video_id>|<title>", e.g. --video
-        /// "dQw4w9WgXcQ|A Real Talk Title". Hand-picked, not
-        /// full-channel-enumerated -- matches this store's existing
-        /// per-advisor ingestion convention. Not required on its own --
-        /// not every persona has a YouTube corpus (see --wikipedia);
-        /// at least one source across all flags is required.
-        #[arg(long = "video")]
+        /// "dQw4w9WgXcQ|A Real Talk Title". Hand-picked -- for
+        /// full-channel enumeration see --channel instead. Not required
+        /// on its own -- not every persona has a YouTube corpus (see
+        /// --wikipedia); at least one source across all flags is
+        /// required. allow_hyphen_values: a real YouTube video ID can
+        /// start with '-' (found 2026-08-09, e.g. "-EMKMPxJrWY") --
+        /// without this, clap misreads "--video -EMKMPxJrWY|title" as
+        /// an unknown "-E..." flag under space-separated invocation.
+        #[arg(long = "video", allow_hyphen_values = true)]
         videos: Vec<String>,
+        /// Repeatable: a channel URL, e.g.
+        /// "https://www.youtube.com/@SomeChannel/videos". Enumerates
+        /// (not downloads-in-full) up to --max-videos of the channel's
+        /// most recent uploads via `yt-dlp --flat-playlist`, merged
+        /// into the same video list --video populates. Fills the gap
+        /// --video's doc comment used to call out (no full-channel
+        /// enumeration existed in this tool before 2026-08-09) --
+        /// previously worked around with an external script translating
+        /// yt-dlp's own enumeration output into a wall of --video flags.
+        #[arg(long = "channel")]
+        channels: Vec<String>,
+        /// Cap on videos enumerated per --channel (ignored for --video,
+        /// which is already an explicit hand-picked list).
+        #[arg(long = "max-videos", default_value_t = 50)]
+        max_videos: usize,
         /// Repeatable: a Wikipedia article title, e.g. "Jordan Peterson".
         /// Fetched via the official MediaWiki API (plain-text extract,
         /// no scraping) -- no auth, no rate-limit concerns for a handful
@@ -198,6 +216,21 @@ enum Commands {
         /// often uses more than one email across repos/years).
         #[arg(long = "git-author")]
         git_author: Vec<String>,
+        /// Repeatable: a real GitHub login (not an email -- GitHub's
+        /// issue-search API matches by account, not commit-trailer
+        /// email) to pull authored issues/PRs for. Requires --git-repo
+        /// (a GitHub URL specifically -- issue search is GitHub-only,
+        /// unlike --git-repo/--git-author's plain `git log`, which works
+        /// against any host).
+        #[arg(long = "github-user")]
+        github_user: Vec<String>,
+        /// Repeatable: a URL to fetch via the locally installed
+        /// `agent-browser` CLI (real browser rendering, so JS-heavy
+        /// pages work -- unlike a plain HTTP GET, which silently
+        /// returns nothing useful for a JS-rendered page). For a
+        /// personal site/blog source.
+        #[arg(long = "website")]
+        website: Vec<String>,
         /// Repeatable: a path to a Claude Code session transcript
         /// (plain `.jsonl`, or a `sessions/<id>.jsonl.gz` archive --
         /// both accepted transparently). ADR-0007: builds the USER'S
@@ -217,6 +250,18 @@ enum Commands {
     /// anytime after `ingest-persona`, safe to retry, skips files that
     /// already have a `.dedup.json` sidecar unless --force is given.
     DedupRaw {
+        #[arg(long)]
+        slug: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sentence-level concept distillation over whatever raw files
+    /// already exist for a slug -- the trm-native port of `advisory/
+    /// tools/dedupe_semantic.py`, producing a much smaller per-file
+    /// `.concepts.json` sidecar of unique-concept sentences alongside
+    /// (not instead of) `dedup-raw`'s coarser output. Re-runnable
+    /// anytime, skips files that already have a sidecar unless --force.
+    ExtractConcepts {
         #[arg(long)]
         slug: String,
         #[arg(long)]
@@ -786,24 +831,35 @@ fn main() -> ExitCode {
             person,
             slug,
             videos,
+            channels,
+            max_videos,
             wikipedia,
             git_repo,
             git_author,
+            github_user,
+            website,
             sessions,
             source,
         } => {
-            let has_advisor_source =
-                !videos.is_empty() || !wikipedia.is_empty() || git_repo.is_some();
+            let has_advisor_source = !videos.is_empty()
+                || !channels.is_empty()
+                || !wikipedia.is_empty()
+                || git_repo.is_some()
+                || !website.is_empty();
             if !has_advisor_source && sessions.is_empty() {
                 eprintln!(
-                    "trm ingest-persona failed: at least one source is required (--video, --wikipedia, --git-repo, or --session)"
+                    "trm ingest-persona failed: at least one source is required (--video, --channel, --wikipedia, --git-repo, --website, or --session)"
                 );
                 return ExitCode::FAILURE;
             }
-            if git_repo.is_some() && git_author.is_empty() {
+            if git_repo.is_some() && git_author.is_empty() && github_user.is_empty() {
                 eprintln!(
-                    "trm ingest-persona failed: --git-repo requires at least one --git-author"
+                    "trm ingest-persona failed: --git-repo requires at least one --git-author or --github-user"
                 );
+                return ExitCode::FAILURE;
+            }
+            if !github_user.is_empty() && git_repo.is_none() {
+                eprintln!("trm ingest-persona failed: --github-user requires --git-repo");
                 return ExitCode::FAILURE;
             }
             // ADR-0007: --session builds the user's own self-persona from
@@ -815,7 +871,7 @@ fn main() -> ExitCode {
             if !sessions.is_empty() && has_advisor_source {
                 eprintln!(
                     "trm ingest-persona failed: --session cannot be combined with \
-                     --video/--wikipedia/--git-repo in the same call"
+                     --video/--channel/--wikipedia/--git-repo/--website in the same call"
                 );
                 return ExitCode::FAILURE;
             }
@@ -832,13 +888,48 @@ fn main() -> ExitCode {
                     )),
                 })
                 .collect();
-            let videos = match parsed {
+            let mut videos = match parsed {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("trm ingest-persona failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
+
+            // --channel: enumerate each channel's most recent max_videos
+            // uploads and merge them in, deduping against any explicit
+            // --video entries for the same id (an explicit hand-picked
+            // --video always wins -- it's more deliberate than whatever
+            // the channel enumeration happened to include).
+            if !channels.is_empty() {
+                let yt_dlp_bin = match persona::ensure_yt_dlp(&data_root) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("trm ingest-persona failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let mut seen: std::collections::HashSet<String> =
+                    videos.iter().map(|v| v.id.clone()).collect();
+                for channel in &channels {
+                    match persona::enumerate_channel_videos(&yt_dlp_bin, channel, max_videos) {
+                        Ok(enumerated) => {
+                            println!(
+                                "--channel {channel:?}: {} video(s) enumerated",
+                                enumerated.len()
+                            );
+                            for v in enumerated {
+                                if seen.insert(v.id.clone()) {
+                                    videos.push(v);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("trm ingest-persona: --channel {channel:?} failed: {e}");
+                        }
+                    }
+                }
+            }
 
             // --session always stages into the fixed self bank (ADR-0007
             // Decision 2) -- -p/--bank's normal override doesn't apply
@@ -912,17 +1003,57 @@ fn main() -> ExitCode {
                 }
             }
             if let Some(repo_url) = &git_repo {
-                match persona::ingest_git_commits(
-                    &paths.raw,
-                    &person,
-                    &slug,
-                    repo_url,
-                    &git_author,
-                    &today,
-                ) {
-                    Ok(mut paths) => source_paths.append(&mut paths),
+                if !git_author.is_empty() {
+                    match persona::ingest_git_commits(
+                        &paths.raw,
+                        &person,
+                        &slug,
+                        repo_url,
+                        &git_author,
+                        &today,
+                    ) {
+                        Ok(mut paths) => source_paths.append(&mut paths),
+                        Err(e) => {
+                            eprintln!("trm ingest-persona failed (git source): {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                if !github_user.is_empty() {
+                    match persona::ingest_git_issues(
+                        &paths.raw,
+                        &person,
+                        &slug,
+                        repo_url,
+                        &github_user,
+                        &today,
+                    ) {
+                        Ok(mut paths) => source_paths.append(&mut paths),
+                        Err(e) => {
+                            eprintln!("trm ingest-persona failed (git-issues source): {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            }
+            if !website.is_empty() {
+                match persona::ingest_websites(&paths.raw, &person, &slug, &website, &today) {
+                    Ok((mut paths, failures)) => {
+                        let succeeded = paths.len();
+                        source_paths.append(&mut paths);
+                        for (url, e) in &failures {
+                            eprintln!("warning: website {url} failed, skipped: {e}");
+                        }
+                        if !failures.is_empty() {
+                            eprintln!(
+                                "website source: {succeeded}/{} succeeded ({} skipped)",
+                                succeeded + failures.len(),
+                                failures.len()
+                            );
+                        }
+                    }
                     Err(e) => {
-                        eprintln!("trm ingest-persona failed (git source): {e}");
+                        eprintln!("trm ingest-persona failed (website source): {e}");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -991,6 +1122,20 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("trm dedup-raw failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::ExtractConcepts { slug, force } => {
+            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            let paths = bank::paths_for(&data_root, &bank_id);
+            match persona::extract_concepts_files(&paths.raw, &slug, force) {
+                Ok(count) => {
+                    println!("extract-concepts: processed {count} raw file(s) for {slug:?}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm extract-concepts failed: {e}");
                     ExitCode::FAILURE
                 }
             }
