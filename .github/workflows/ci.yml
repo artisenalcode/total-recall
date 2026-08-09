@@ -40,13 +40,23 @@ jobs:
           repository: artisenalcode/squishi
           token: ${{ secrets.SQUISHI_CHECKOUT_PAT }}
           path: squishi-checkout
+      # Real bug found 2026-08-09: keying the cache on Cargo.lock alone
+      # means a squishi change that touches only src/ (no new dependency)
+      # doesn't invalidate the cache -- CI silently reuses a stale binary
+      # built before that change, and every test depending on the new
+      # behavior fails against the old squishi. The checked-out commit SHA
+      # is the actual identity of what's being built; key on that instead.
+      - name: Get squishi commit SHA
+        if: ${{ env.SQUISHI_CHECKOUT_PAT != '' }}
+        id: squishi-sha
+        run: echo "sha=$(git -C squishi-checkout rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Cache squishi build
         if: ${{ env.SQUISHI_CHECKOUT_PAT != '' }}
         id: squishi-bin-cache
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/squishi
-          key: ${{ runner.os }}-squishi-bin-${{ hashFiles('squishi-checkout/Cargo.lock') }}
+          key: ${{ runner.os }}-squishi-bin-${{ steps.squishi-sha.outputs.sha }}
       - name: Build and install squishi
         if: ${{ env.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
         run: cargo install --path squishi-checkout --locked
