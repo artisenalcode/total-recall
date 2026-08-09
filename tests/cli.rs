@@ -626,3 +626,138 @@ fn ingest_persona_session_cannot_mix_with_video_source() {
         "no bank should have been created for a rejected mixed-source call"
     );
 }
+
+// --- --since-checkpoint (ADR-0006 Phase 2) ---
+
+/// The real incremental contract, end to end through the real binary +
+/// real squishi subprocess: staging the same (growing) transcript twice
+/// with `--since-checkpoint` only adds new `raw/` content on the second
+/// call for what's actually new, and a third call with nothing new since
+/// then is a clean Skipped, not an error.
+#[test]
+fn ingest_session_since_checkpoint_stages_only_the_delta_across_repeated_calls() {
+    if !squishi_on_path() {
+        eprintln!(
+            "skipping ingest_session_since_checkpoint_stages_only_the_delta_across_repeated_calls: \
+             squishi not on PATH (see squishi_on_path's doc comment)"
+        );
+        return;
+    }
+    let data_root = scratch_data_root();
+    let session_repo = tempfile::tempdir().expect("failed to create session repo dir");
+    std::fs::create_dir(session_repo.path().join(".git")).unwrap();
+    std::fs::write(session_repo.path().join(".trm-bank"), "checkpoint-bank\n").unwrap();
+    let session_cwd_json = serde_json::to_string(session_repo.path().to_str().unwrap()).unwrap();
+
+    let transcript_dir = tempfile::tempdir().expect("failed to create transcript dir");
+    let transcript_path = transcript_dir.path().join("sess-checkpoint-1.jsonl");
+    let first_turn = format!(
+        r#"{{"type":"user","sessionId":"sess-checkpoint-1","cwd":{session_cwd_json},"timestamp":"t1","message":{{"role":"user","content":[{{"type":"text","text":"a real first question"}}]}}}}"#
+    );
+    std::fs::write(&transcript_path, format!("{first_turn}\n")).unwrap();
+
+    // Call 1: stages the first turn, advances the checkpoint.
+    let output1 = run_trm(
+        &[
+            "ingest-session",
+            transcript_path.to_str().unwrap(),
+            "--since-checkpoint",
+        ],
+        data_root.path(),
+    );
+    assert!(
+        output1.status.success(),
+        "call 1 exited non-zero: stdout={} stderr={}",
+        String::from_utf8_lossy(&output1.stdout),
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output1.stdout).starts_with("staged:"));
+
+    let raw_dir = data_root
+        .path()
+        .join("banks")
+        .join("checkpoint-bank")
+        .join("raw");
+    let count_after_first = std::fs::read_dir(&raw_dir).unwrap().count();
+    assert_eq!(count_after_first, 1);
+
+    // Transcript grows with a second turn.
+    let second_turn = format!(
+        r#"{{"type":"assistant","sessionId":"sess-checkpoint-1","cwd":{session_cwd_json},"timestamp":"t2","message":{{"role":"assistant","content":[{{"type":"text","text":"a real second answer"}}]}}}}"#
+    );
+    std::fs::write(&transcript_path, format!("{first_turn}\n{second_turn}\n")).unwrap();
+
+    // Call 2: stages only the delta (the second turn).
+    let output2 = run_trm(
+        &[
+            "ingest-session",
+            transcript_path.to_str().unwrap(),
+            "--since-checkpoint",
+        ],
+        data_root.path(),
+    );
+    assert!(output2.status.success());
+    assert!(String::from_utf8_lossy(&output2.stdout).starts_with("staged:"));
+
+    let count_after_second = std::fs::read_dir(&raw_dir).unwrap().count();
+    assert_eq!(
+        count_after_second,
+        count_after_first + 1,
+        "call 2 should stage exactly one new raw entry (the delta), not restage the whole transcript"
+    );
+
+    // Call 3: nothing new since call 2 -- a clean skip, not an error, and
+    // no new raw/ entries.
+    let output3 = run_trm(
+        &[
+            "ingest-session",
+            transcript_path.to_str().unwrap(),
+            "--since-checkpoint",
+        ],
+        data_root.path(),
+    );
+    assert!(output3.status.success());
+    assert!(
+        String::from_utf8_lossy(&output3.stdout).starts_with("skipped:"),
+        "expected a clean skip on the third call, got: {}",
+        String::from_utf8_lossy(&output3.stdout)
+    );
+    let count_after_third = std::fs::read_dir(&raw_dir).unwrap().count();
+    assert_eq!(count_after_third, count_after_second);
+
+    // Source transcript is never touched by --since-checkpoint (unlike
+    // --archive-after) -- still on disk, still the full two-turn content.
+    assert!(transcript_path.exists());
+}
+
+/// `--archive-after` and `--since-checkpoint` are mutually exclusive
+/// (archival is for a finished session; since-checkpoint is for one
+/// that's still running) -- must fail before touching the transcript.
+#[test]
+fn ingest_session_archive_after_and_since_checkpoint_cannot_combine() {
+    let data_root = scratch_data_root();
+    let transcript_dir = tempfile::tempdir().expect("failed to create transcript dir");
+    let transcript_path = transcript_dir.path().join("irrelevant.jsonl");
+    std::fs::write(&transcript_path, "irrelevant content").unwrap();
+
+    let output = run_trm(
+        &[
+            "ingest-session",
+            transcript_path.to_str().unwrap(),
+            "--archive-after",
+            "--since-checkpoint",
+        ],
+        data_root.path(),
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot be combined"),
+        "expected the mutual-exclusion error, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        transcript_path.exists(),
+        "a rejected combination must never touch the source transcript"
+    );
+}

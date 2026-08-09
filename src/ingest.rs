@@ -23,6 +23,11 @@ pub struct SessionDigest {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
     pub turn_count: usize,
+    /// squishi's real total line count for the transcript this digest
+    /// came from (ADR-0006 Phase 2) — independent of whatever `start_line`
+    /// the call used. An incremental caller (`--since-checkpoint`) saves
+    /// this as the session's new `last_staged_line`.
+    pub total_lines: usize,
 }
 
 /// Parse `squishi --session-digest ... --json`'s real output shape.
@@ -49,12 +54,17 @@ pub fn parse_squishi_json(json_str: &str) -> Result<SessionDigest, String> {
         .get("turn_count")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
+    let total_lines = value
+        .get("total_lines")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
 
     Ok(SessionDigest {
         content,
         session_id,
         cwd,
         turn_count,
+        total_lines,
     })
 }
 
@@ -68,15 +78,28 @@ pub fn build_reason(digest: &SessionDigest) -> String {
     )
 }
 
-/// Spawn `squishi --session-digest <path> --json` and parse its output.
-/// Real process I/O — not unit-tested directly (mocking a subprocess
-/// call buys nothing real); covered by the black-box CLI tests instead,
-/// same discipline as every other real-subprocess boundary in this
-/// project.
+/// Spawn `squishi --session-digest <path> --json` (whole-file, `--start-line
+/// 0`) and parse its output. Thin wrapper over `run_squishi_session_digest_from`
+/// — unchanged behavior for every existing caller.
 pub fn run_squishi_session_digest(path: &Path) -> Result<SessionDigest, String> {
+    run_squishi_session_digest_from(path, 0)
+}
+
+/// Same as `run_squishi_session_digest`, but with an explicit `--start-line`
+/// (ADR-0006 Phase 2) — an incremental caller passes the session's saved
+/// `last_staged_line` here and gets back only the delta. Real process I/O
+/// — not unit-tested directly (mocking a subprocess call buys nothing
+/// real); covered by the black-box CLI tests instead, same discipline as
+/// every other real-subprocess boundary in this project.
+pub fn run_squishi_session_digest_from(
+    path: &Path,
+    start_line: usize,
+) -> Result<SessionDigest, String> {
     let output = Command::new("squishi")
         .arg("--session-digest")
         .arg(path)
+        .arg("--start-line")
+        .arg(start_line.to_string())
         .arg("--json")
         .output()
         .map_err(|e| format!("squishi not on PATH: {e}"))?;
@@ -214,8 +237,9 @@ mod tests {
 
     /// Real shape — matches squishi's actual `--session-digest --json`
     /// output exactly (verified live against the real binary before
-    /// this fixture was written, not guessed).
-    const REAL_SHAPE_JSON: &str = r#"{"chars_after":100,"chars_before":200,"content":"SESSION DIGEST sess-1\n\n---\ntype: session-digest\nsession_id: sess-1\ncwd: /repo\nfirst_ts: t1\nlast_ts: t2\nturn_count: 3\n---\n\nbody","cwd":"/repo","first_ts":"t1","last_ts":"t2","raw_bytes":9000,"session_id":"sess-1","truncated":false,"turn_count":3}"#;
+    /// this fixture was written, not guessed; `total_lines` added
+    /// ADR-0006 Phase 2, reverified live the same way).
+    const REAL_SHAPE_JSON: &str = r#"{"chars_after":100,"chars_before":200,"content":"SESSION DIGEST sess-1\n\n---\ntype: session-digest\nsession_id: sess-1\ncwd: /repo\nfirst_ts: t1\nlast_ts: t2\nturn_count: 3\n---\n\nbody","cwd":"/repo","first_ts":"t1","last_ts":"t2","raw_bytes":9000,"session_id":"sess-1","total_lines":5,"truncated":false,"turn_count":3}"#;
 
     #[test]
     fn parse_squishi_json_extracts_the_real_fields() {
@@ -223,6 +247,7 @@ mod tests {
         assert_eq!(digest.session_id.as_deref(), Some("sess-1"));
         assert_eq!(digest.cwd.as_deref(), Some("/repo"));
         assert_eq!(digest.turn_count, 3);
+        assert_eq!(digest.total_lines, 5);
         assert!(digest.content.starts_with("SESSION DIGEST sess-1"));
     }
 
@@ -252,6 +277,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             cwd: Some("/repo".to_string()),
             turn_count: 5,
+            total_lines: 0,
         };
         let reason = build_reason(&digest);
         assert_eq!(
