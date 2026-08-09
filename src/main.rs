@@ -137,9 +137,26 @@ enum Commands {
         /// After staging succeeds, gzip-archive the transcript into the
         /// resolved bank's `sessions/` tier and remove the original from
         /// its source location. Only safe for a FINISHED session (ADR-0006
-        /// Phase 1) -- never pass this for a still-live transcript.
+        /// Phase 1) -- never pass this for a still-live transcript. Cannot
+        /// be combined with --since-checkpoint (see its own doc comment).
         #[arg(long)]
         archive_after: bool,
+        /// Stage only the delta since this session's last staged line
+        /// (ADR-0006 Phase 2), instead of the whole transcript -- the
+        /// live, in-session counterpart to --archive-after's
+        /// finished-session archival. Resolves the bank from a cheap
+        /// peek at the transcript (no full digest needed just to find
+        /// the checkpoint), loads that bank's saved `last_staged_line`,
+        /// passes it to squishi as `--start-line`, and advances the
+        /// checkpoint to the new `total_lines` on success. "Nothing new
+        /// since last checkpoint" is a normal outcome (Skipped), not a
+        /// failure. Cannot be combined with --archive-after: archiving is
+        /// for a session that's finished, since-checkpoint is for one
+        /// that's still running -- combining them risks archiving (and
+        /// deleting) a transcript a live Claude Code process may still
+        /// have open.
+        #[arg(long)]
+        since_checkpoint: bool,
         /// Which trigger is calling this. `manual` (default, this
         /// command's original behavior) is never gated by `trm.json`'s
         /// hook-enable flags; `precompact`/`sessionend` are -- a disabled
@@ -398,8 +415,25 @@ silently. `trm.json` also gates staging via `staging.min_turns`/
 `staging.min_bytes` (both default to effectively "stage everything",
 matching pre-`trm.json` behavior). See `<data_root>/trm.json` (global)
 and `<repo_root>/.trm/trm.json` (project override, merged field-by-field
-on top) for the full schema. No live, in-session incremental staging yet
-(`PreCompact` hook wiring is ADR-0006 Phase 2, not built).
+on top) for the full schema.
+
+**Live, in-session staging (ADR-0006 Phase 2, for a STILL-RUNNING session
+only — never combine with `--archive-after`).** `--since-checkpoint`
+stages only the delta since this session's last saved checkpoint line,
+instead of the whole transcript: resolves the bank from a cheap peek at
+the transcript (no full digest needed just to find the checkpoint), asks
+squishi for `--start-line <last_staged_line>`, and advances the
+checkpoint to the new `total_lines` on success. "Nothing new since the
+last checkpoint" is a normal `skipped:` outcome, not a failure — an
+incremental call landing on an unchanged transcript is expected, not
+exceptional. `scripts/claude-code-precompact-hook.sh` wires this to
+Claude Code's own `PreCompact` hook (fires right before `/compact` would
+summarize/discard detail): `trm ingest-session "$transcript_path"
+--since-checkpoint --trigger precompact`, wrapped in a 30s timeout and
+never failing the hook itself — a staging failure is logged, never blocks
+compaction. Install globally in `~/.claude/settings.json`'s `hooks.PreCompact`
+(matcher `"manual|auto"`, matching both trigger sources) to cover every
+project, or per-project in that repo's own `.claude/settings.json`.
 
 ## Ingest a persona (build an advisor from YouTube)
 
@@ -710,32 +744,44 @@ fn main() -> ExitCode {
         Commands::IngestSession {
             path,
             archive_after,
+            since_checkpoint,
             trigger,
-        } => match ingest_session(
-            &data_root,
-            &cwd,
-            cli.bank.as_deref(),
-            &path,
-            archive_after,
-            trigger,
-        ) {
-            Ok(IngestOutcome::Staged { job_id, archived }) => {
-                if archived {
-                    println!("staged: {job_id} (archived)");
-                } else {
-                    println!("staged: {job_id}");
+        } => {
+            if archive_after && since_checkpoint {
+                eprintln!(
+                    "trm ingest-session failed: --archive-after and --since-checkpoint \
+                     cannot be combined -- archival is for a finished session, \
+                     since-checkpoint is for one that's still running"
+                );
+                return ExitCode::FAILURE;
+            }
+            match ingest_session(
+                &data_root,
+                &cwd,
+                cli.bank.as_deref(),
+                &path,
+                archive_after,
+                since_checkpoint,
+                trigger,
+            ) {
+                Ok(IngestOutcome::Staged { job_id, archived }) => {
+                    if archived {
+                        println!("staged: {job_id} (archived)");
+                    } else {
+                        println!("staged: {job_id}");
+                    }
+                    ExitCode::SUCCESS
                 }
-                ExitCode::SUCCESS
+                Ok(IngestOutcome::Skipped(reason)) => {
+                    println!("skipped: {reason}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm ingest-session failed: {e}");
+                    ExitCode::FAILURE
+                }
             }
-            Ok(IngestOutcome::Skipped(reason)) => {
-                println!("skipped: {reason}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("trm ingest-session failed: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Commands::IngestPersona {
             person,
             slug,
@@ -1076,19 +1122,57 @@ enum IngestOutcome {
 /// Full `trm ingest-session` flow, pulled out of `main()`'s match arm so
 /// it's independently testable against real fixtures — same reasoning
 /// `stage`/`pending` already established for this file's other command
-/// bodies. ADR-0006 Phase 1: whole-transcript digest + stage, optionally
-/// followed by archiving the source transcript. No line-level checkpoint
-/// here — that's Phase 2's live-compaction concern (see the plan doc).
+/// bodies. ADR-0006: whole-transcript digest + stage by default
+/// (Phase 1), optionally followed by archiving the source transcript
+/// (`archive_after`, finished sessions only) or scoped to just the delta
+/// since a saved checkpoint (`since_checkpoint`, Phase 2, live sessions
+/// only) — mutually exclusive, enforced both at the CLI layer and here.
+#[allow(clippy::too_many_arguments)]
 fn ingest_session(
     data_root: &std::path::Path,
     cwd: &std::path::Path,
     explicit_bank: Option<&str>,
     transcript_path: &std::path::Path,
     archive_after: bool,
+    since_checkpoint: bool,
     trigger: Trigger,
 ) -> Result<IngestOutcome, String> {
-    let digest = ingest::run_squishi_session_digest(transcript_path)?;
+    if archive_after && since_checkpoint {
+        return Err("--archive-after and --since-checkpoint cannot be combined".to_string());
+    }
+
+    // Incremental start_line: resolved from a cheap peek (no squishi
+    // subprocess) at the transcript's own sessionId/cwd, so the
+    // checkpoint lookup doesn't need a full digest first. A peek failure
+    // (unreadable/empty file) falls through to start_line 0 -- the
+    // subsequent full digest call surfaces whatever the real problem is,
+    // rather than this function guessing at one.
+    let start_line = if since_checkpoint {
+        match ingest::peek_session_meta(transcript_path) {
+            Some((session_id, peeked_cwd)) => {
+                let bank_id = bank::resolve_bank_id(explicit_bank, &peeked_cwd);
+                let paths = bank::paths_for(data_root, &bank_id);
+                let checkpoint = session_checkpoint::load(&paths.session_state);
+                session_checkpoint::last_staged_line(&checkpoint, &session_id)
+            }
+            None => 0,
+        }
+    } else {
+        0
+    };
+
+    let digest = ingest::run_squishi_session_digest_from(transcript_path, start_line)?;
     if digest.content.trim().is_empty() {
+        // An incremental call landing on "nothing new since the last
+        // checkpoint" is a normal outcome, not a failure -- squishi
+        // itself already treats it this way for start_line > 0 (see
+        // ADR-0006 Phase 2). A genuinely empty whole-file digest is
+        // still worth failing loudly on, unchanged from Phase 1.
+        if since_checkpoint {
+            return Ok(IngestOutcome::Skipped(
+                "nothing new since last checkpoint".to_string(),
+            ));
+        }
         return Err("nothing to digest (empty session)".to_string());
     }
 
@@ -1133,6 +1217,15 @@ fn ingest_session(
         &reason,
         "direct",
     )?;
+
+    if since_checkpoint {
+        let bank_id = bank::resolve_bank_id(explicit_bank, &session_cwd);
+        let paths = bank::paths_for(data_root, &bank_id);
+        let session_id = digest.session_id.clone().unwrap_or_else(|| job_id.clone());
+        let mut checkpoint = session_checkpoint::load(&paths.session_state);
+        session_checkpoint::mark_staged(&mut checkpoint, &session_id, digest.total_lines);
+        session_checkpoint::save(&paths.session_state, &checkpoint).map_err(|e| e.to_string())?;
+    }
 
     if !archive_after {
         return Ok(IngestOutcome::Staged {
@@ -1225,7 +1318,15 @@ fn ingest_sessions_all(
             continue;
         }
 
-        match ingest_session(data_root, &session_cwd, None, &path, true, Trigger::Manual) {
+        match ingest_session(
+            data_root,
+            &session_cwd,
+            None,
+            &path,
+            true,
+            false,
+            Trigger::Manual,
+        ) {
             Ok(IngestOutcome::Staged { archived: true, .. }) => stats.archived += 1,
             Ok(IngestOutcome::Staged {
                 archived: false, ..
@@ -1421,6 +1522,14 @@ mod tests {
         assert!(CORE_DOCS.contains("--archive-after"));
         assert!(CORE_DOCS.contains("trm.json"));
         assert!(CORE_DOCS.contains("CLAUDE_CODE_SESSION_ID"));
+    }
+
+    #[test]
+    fn core_docs_covers_precompact_incremental_staging() {
+        assert!(CORE_DOCS.contains("--since-checkpoint"));
+        assert!(CORE_DOCS.contains("claude-code-precompact-hook.sh"));
+        assert!(CORE_DOCS.contains("PreCompact"));
+        assert!(CORE_DOCS.contains("last_staged_line"));
     }
 
     #[test]

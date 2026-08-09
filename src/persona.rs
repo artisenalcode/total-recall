@@ -1082,6 +1082,7 @@ mod tests {
             session_id: Some("sess-abc123".to_string()),
             cwd: Some("/home/alvin/Code/_labs/squishi".to_string()),
             turn_count: 2,
+            total_lines: 4,
         };
         let md = build_session_raw_md(
             "Alvin Tolentino",
@@ -1106,6 +1107,7 @@ mod tests {
             session_id: None,
             cwd: None,
             turn_count: 1,
+            total_lines: 1,
         };
         let md = build_session_raw_md(
             "Alvin Tolentino",

@@ -1,19 +1,23 @@
-//! Per-bank archival checkpoint (ADR-0006 Phase 1): tracks which session
-//! transcripts have already been archived, so `trm ingest-sessions --all`
-//! is resumable — a second sweep is a no-op over sessions already done.
+//! Per-bank session checkpoint: tracks two independent things per
+//! session id.
 //!
-//! Phase 1 scope only: an `archived` boolean per session id, nothing
-//! line-offset-based. Live in-session incremental staging (Phase 2, the
-//! `PreCompact` hook) needs a `last_staged_line` too, but that's a
-//! different, still-open problem (see
-//! docs/ideation/memory-cli/plan-2026-08-09-automated-session-staging.md's
-//! Phasing section) — not added here speculatively.
+//! - `archived` (ADR-0006 Phase 1): whether the transcript has been
+//!   gzip-archived and removed from `~/.claude/projects/` — so `trm
+//!   ingest-sessions --all` is resumable, a second sweep a no-op over
+//!   sessions already done.
+//! - `last_staged_line` (ADR-0006 Phase 2): how many lines of a still-
+//!   LIVE session have already been staged, so `--since-checkpoint`
+//!   stages only the delta on each `PreCompact` firing instead of
+//!   restaging the whole transcript every time. Independent of
+//!   `archived` — a live session is never archived (can't be, it's still
+//!   running), and an archived session's `last_staged_line` no longer
+//!   matters once the source is gone.
 //!
 //! Defensive parsing throughout, same discipline squishi's `session_prune`
 //! established for transcript JSONL: this file's shape isn't a versioned
 //! contract either, so a missing or malformed file degrades to "nothing
-//! archived yet" rather than erroring — a fresh bank with no checkpoint
-//! file at all is exactly that state, not a failure.
+//! staged/archived yet" rather than erroring — a fresh bank with no
+//! checkpoint file at all is exactly that state, not a failure.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -22,6 +26,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionCheckpointEntry {
     pub archived: bool,
+    pub last_staged_line: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -45,9 +50,17 @@ pub fn load(path: &Path) -> Checkpoint {
             .get("archived")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        checkpoint
-            .sessions
-            .insert(session_id, SessionCheckpointEntry { archived });
+        let last_staged_line = entry
+            .get("last_staged_line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        checkpoint.sessions.insert(
+            session_id,
+            SessionCheckpointEntry {
+                archived,
+                last_staged_line,
+            },
+        );
     }
     checkpoint
 }
@@ -60,6 +73,10 @@ pub fn save(path: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
     for (session_id, entry) in &checkpoint.sessions {
         let mut entry_obj = serde_json::Map::new();
         entry_obj.insert("archived".to_string(), Value::from(entry.archived));
+        entry_obj.insert(
+            "last_staged_line".to_string(),
+            Value::from(entry.last_staged_line),
+        );
         object.insert(session_id.clone(), Value::Object(entry_obj));
     }
     let contents =
@@ -83,6 +100,31 @@ pub fn mark_archived(checkpoint: &mut Checkpoint, session_id: &str) {
         .entry(session_id.to_string())
         .or_default()
         .archived = true;
+}
+
+/// `0` for a session never recorded — the natural "nothing staged yet"
+/// default, matching squishi's own `--session-digest --start-line 0`
+/// whole-file behavior for a session `--since-checkpoint` has never seen.
+pub fn last_staged_line(checkpoint: &Checkpoint, session_id: &str) -> usize {
+    checkpoint
+        .sessions
+        .get(session_id)
+        .map(|e| e.last_staged_line)
+        .unwrap_or(0)
+}
+
+/// Record how many lines of `session_id` have been staged. Callers
+/// persist via `save` after. Unlike `mark_archived` (a one-way flag),
+/// this is expected to be called repeatedly across a live session's
+/// lifetime as `--since-checkpoint` advances it on each `PreCompact`
+/// firing — always sets to `line` directly (the caller already knows the
+/// real total from squishi's own `total_lines`), never accumulates.
+pub fn mark_staged(checkpoint: &mut Checkpoint, session_id: &str, line: usize) {
+    checkpoint
+        .sessions
+        .entry(session_id.to_string())
+        .or_default()
+        .last_staged_line = line;
 }
 
 #[cfg(test)]
@@ -133,5 +175,55 @@ mod tests {
         mark_archived(&mut checkpoint, "sess-1");
         assert_eq!(checkpoint.sessions.len(), 1);
         assert!(is_archived(&checkpoint, "sess-1"));
+    }
+
+    // --- last_staged_line / mark_staged (ADR-0006 Phase 2) ---
+
+    #[test]
+    fn unseen_session_has_last_staged_line_zero() {
+        let checkpoint = Checkpoint::default();
+        assert_eq!(last_staged_line(&checkpoint, "sess-1"), 0);
+    }
+
+    #[test]
+    fn mark_staged_advances_last_staged_line() {
+        let mut checkpoint = Checkpoint::default();
+        mark_staged(&mut checkpoint, "sess-1", 42);
+        assert_eq!(last_staged_line(&checkpoint, "sess-1"), 42);
+        // A later call sets, doesn't accumulate -- the caller always
+        // passes the real total from squishi, not a delta to add.
+        mark_staged(&mut checkpoint, "sess-1", 90);
+        assert_eq!(last_staged_line(&checkpoint, "sess-1"), 90);
+    }
+
+    #[test]
+    fn last_staged_line_round_trips_through_save_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".session-state.json");
+
+        let mut checkpoint = Checkpoint::default();
+        mark_staged(&mut checkpoint, "sess-1", 123);
+        save(&path, &checkpoint).unwrap();
+
+        let loaded = load(&path);
+        assert_eq!(last_staged_line(&loaded, "sess-1"), 123);
+    }
+
+    #[test]
+    fn archived_and_last_staged_line_are_independent_fields() {
+        // Setting one must not disturb the other -- they're tracked per
+        // session but represent genuinely different, independently-
+        // updated facts (see module doc comment).
+        let mut checkpoint = Checkpoint::default();
+        mark_staged(&mut checkpoint, "sess-1", 50);
+        mark_archived(&mut checkpoint, "sess-1");
+        assert_eq!(last_staged_line(&checkpoint, "sess-1"), 50);
+        assert!(is_archived(&checkpoint, "sess-1"));
+
+        let mut checkpoint2 = Checkpoint::default();
+        mark_archived(&mut checkpoint2, "sess-2");
+        mark_staged(&mut checkpoint2, "sess-2", 7);
+        assert!(is_archived(&checkpoint2, "sess-2"));
+        assert_eq!(last_staged_line(&checkpoint2, "sess-2"), 7);
     }
 }
