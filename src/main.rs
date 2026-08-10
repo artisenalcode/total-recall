@@ -267,6 +267,19 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Cross-file recurrence clustering: pools every already-deduped
+    /// source file's `.dedup.json` sidecar for a slug into one document
+    /// and runs squishi's dedup once more over the pool. Squishi's
+    /// existing greedy clustering does the work -- each dropped sentence
+    /// records which survivor it collapsed into, so counting drops per
+    /// survivor gives a mechanical recurrence score, no LLM involved.
+    /// Requires `dedup-raw` to have already run for this slug. Writes
+    /// `<raw>/<slug>/cluster-summary.json` (topics + recurring stories,
+    /// ranked by cluster_size).
+    ClusterRaw {
+        #[arg(long)]
+        slug: String,
+    },
 }
 
 /// Which caller is invoking `ingest-session` (ADR-0006 Phase 1). `manual`
@@ -1152,6 +1165,20 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("trm extract-concepts failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::ClusterRaw { slug } => {
+            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            let paths = bank::paths_for(&data_root, &bank_id);
+            match persona::cluster_raw_files(&paths.raw, &slug) {
+                Ok(path) => {
+                    println!("cluster-raw: wrote {}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm cluster-raw failed: {e}");
                     ExitCode::FAILURE
                 }
             }
