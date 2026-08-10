@@ -202,6 +202,87 @@ fn complete_handover_reads_from_stdin_when_no_argument_given() {
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("completed:"));
 }
 
+/// The whole trm/persona boundary (ADR-0009): a caller hands trm one
+/// manifest file, trm owns every internal detail of turning it into a
+/// pending job. Real artifact files (dedup/cluster/lexicon-shaped, but
+/// content doesn't matter here) referenced by path, not embedded.
+#[test]
+fn stage_persona_stages_a_job_from_a_manifest_referencing_real_artifacts() {
+    let data_root = scratch_data_root();
+    let work_dir = tempfile::tempdir().unwrap();
+    let artifact_path = work_dir.path().join("roy-sugarman.dedup.json");
+    std::fs::write(&artifact_path, r#"{"compressed": "some cleaned text"}"#).unwrap();
+
+    let manifest = serde_json::json!({
+        "slug": "roy-sugarman",
+        "bank": "test-bank",
+        "description": "synthesize a persona wiki from dedup/cluster/lexicon output",
+        "source_label": "persona-pipeline",
+        "self_build": false,
+        "artifacts": [artifact_path.to_string_lossy()],
+    });
+    let manifest_path = work_dir.path().join("manifest.json");
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let output = run_trm(
+        &[
+            "stage-persona",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+        ],
+        data_root.path(),
+    );
+
+    assert!(
+        output.status.success(),
+        "trm stage-persona exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "staged: roy-sugarman");
+
+    // A real pending marker exists under the bank the MANIFEST named
+    // (no --bank flag was passed) and references the artifact path --
+    // proves trm read the manifest's fields, not just accepted the file.
+    let pending_path = data_root
+        .path()
+        .join("banks")
+        .join("test-bank")
+        .join("pending")
+        .join("roy-sugarman.md");
+    let pending_content = std::fs::read_to_string(&pending_path)
+        .expect("pending marker should exist under the manifest's bank");
+    assert!(pending_content.contains("roy-sugarman.dedup.json"));
+
+    // `trm pending --all` -- the real, cross-bank discovery surface
+    // this whole design exists to keep unified -- sees it.
+    let pending_output = run_trm(&["pending", "--all"], data_root.path());
+    assert!(
+        String::from_utf8_lossy(&pending_output.stdout).contains("roy-sugarman"),
+        "staged persona job should show up in `trm pending --all`"
+    );
+}
+
+#[test]
+fn stage_persona_rejects_a_manifest_missing_required_fields() {
+    let data_root = scratch_data_root();
+    let work_dir = tempfile::tempdir().unwrap();
+    let manifest_path = work_dir.path().join("manifest.json");
+    std::fs::write(&manifest_path, r#"{"slug": "roy-sugarman"}"#).unwrap();
+
+    let output = run_trm(
+        &[
+            "stage-persona",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+        ],
+        data_root.path(),
+    );
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing required"));
+}
+
 /// No positional argument AND stdin is a real pipe with nothing written
 /// to it (immediate EOF, not a terminal) — a real, legitimate "empty
 /// content" case, distinct from the terminal-refusal path (which this
