@@ -10,6 +10,7 @@ mod embed_cache;
 mod embeddings;
 mod handover;
 mod ingest;
+mod lexicon;
 mod lock;
 mod persona;
 mod session_checkpoint;
@@ -288,6 +289,19 @@ enum Commands {
     /// `<raw>/<slug>/cluster-summary.json` (topics + recurring stories,
     /// ranked by cluster_size).
     ClusterRaw {
+        #[arg(long)]
+        slug: String,
+    },
+    /// Mechanical, model-free concept-recurrence scan: counts 2-4 word
+    /// phrases across every source file's `.dedup.json` text, ranked by
+    /// how many distinct source files a phrase appears in. Catches
+    /// named recurring terms/frameworks that `cluster-raw`'s sentence-
+    /// embedding clustering can't -- a person re-explaining the same
+    /// concept in different words each time never clusters at the
+    /// sentence level, but a named term they keep returning to ("DARN-
+    /// C", "the purpose stack") recurs literally. No embedding model,
+    /// no network. Writes `<raw>/<slug>/lexicon.json`.
+    LexiconScan {
         #[arg(long)]
         slug: String,
     },
@@ -1228,6 +1242,20 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("trm cluster-raw failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::LexiconScan { slug } => {
+            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            let paths = bank::paths_for(&data_root, &bank_id);
+            match lexicon::write_lexicon(&paths.raw, &slug) {
+                Ok(path) => {
+                    println!("lexicon-scan: wrote {}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm lexicon-scan failed: {e}");
                     ExitCode::FAILURE
                 }
             }
