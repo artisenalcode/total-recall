@@ -11,6 +11,7 @@ mod embeddings;
 mod handover;
 mod ingest;
 mod lexicon;
+mod lexicon_common_words;
 mod lock;
 mod persona;
 mod session_checkpoint;
