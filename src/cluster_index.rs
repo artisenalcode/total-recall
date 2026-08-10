@@ -37,19 +37,42 @@ use std::path::{Path, PathBuf};
 /// paraphrase-collapse decision, just made without a positional window.
 pub const PARAPHRASE_THRESHOLD: f32 = 0.80;
 
+/// A cluster whose members appear near-verbatim in at least this many
+/// distinct source files is flagged as *likely* boilerplate (recorded
+/// intros/outros, sponsor reads, "please leave a review") rather than a
+/// genuinely recurring idea. This is deliberately a flag, not a filter
+/// -- real signal found pressure-testing against Roy Sugarman's corpus:
+/// a spontaneously-recurring idea structurally almost never produces a
+/// tight sentence-embedding cluster, because a person re-explains the
+/// same concept in different words each time (that's the whole reason
+/// `lexicon_scan` exists as a separate tool). A sentence-level cluster
+/// this tight is much more likely literal, scripted repetition. Kept
+/// low (2) on purpose: real false positives exist (a genuinely
+/// memorized catchphrase someone recites the same way every time would
+/// also trigger this) -- final judgment belongs to whatever reads this
+/// flag next, not this heuristic.
+const BOILERPLATE_CLUSTER_SIZE_FLOOR: usize = 2;
+
 /// One ranked cluster: a sentence that survived clustering, plus how
 /// many other sentences (across every source file) collapsed into it.
 /// High `cluster_size` on a `concept`-shaped sentence is a recurring
 /// topic; on a `narrative`-shaped one, a recurring story.
+/// `likely_boilerplate` is a flag for human/LLM review, not a filter --
+/// see `BOILERPLATE_CLUSTER_SIZE_FLOOR`'s doc comment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecurrenceCluster {
     pub text: String,
     pub cluster_size: usize,
+    pub likely_boilerplate: bool,
 }
 
 impl From<&RecurrenceCluster> for Value {
     fn from(c: &RecurrenceCluster) -> Value {
-        serde_json::json!({ "text": c.text, "cluster_size": c.cluster_size })
+        serde_json::json!({
+            "text": c.text,
+            "cluster_size": c.cluster_size,
+            "likely_boilerplate": c.likely_boilerplate,
+        })
     }
 }
 
@@ -290,6 +313,7 @@ pub fn cluster(
         let cluster = RecurrenceCluster {
             text,
             cluster_size: size,
+            likely_boilerplate: size >= BOILERPLATE_CLUSTER_SIZE_FLOOR,
         };
         match shape.as_str() {
             "narrative" => stories.push(cluster),
@@ -454,12 +478,23 @@ mod tests {
             "expected all 3 near-duplicates to collapse into one cluster: {top:?}"
         );
         assert!(top.text.to_lowercase().contains("motivation"));
+        assert!(
+            top.likely_boilerplate,
+            "a sentence repeated near-verbatim across 3 separate files should be flagged: {top:?}"
+        );
 
-        // Every one-off aside should remain its own singleton cluster.
-        let singleton_count = topics.iter().filter(|c| c.cluster_size == 1).count();
+        // Every one-off aside should remain its own singleton cluster,
+        // and none of them should be flagged -- a real one-off is
+        // exactly what the flag must NOT catch.
+        let singletons: Vec<_> = topics.iter().filter(|c| c.cluster_size == 1).collect();
         assert_eq!(
-            singleton_count, 3,
+            singletons.len(),
+            3,
             "each one-off aside should be its own cluster: {topics:?}"
+        );
+        assert!(
+            singletons.iter().all(|c| !c.likely_boilerplate),
+            "singleton clusters should never be flagged as boilerplate: {singletons:?}"
         );
     }
 }
