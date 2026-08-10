@@ -36,8 +36,194 @@ const STOPWORDS: &[&str] = &[
     "for", "as", "if", "then", "than", "not", "just", "like", "um", "uh",
 ];
 
+/// A much broader list of generic, high-frequency spoken-English words
+/// -- the real fix for a genuine bug found scanning Roy Sugarman's real
+/// corpus: edge-trimming alone let phrases like "you've got" and "how
+/// do" dominate the whole ranking, because neither word sits at either
+/// list above (contractions like "you've" were never covered, and mid-
+/// frequency verbs like "got"/"going" aren't function words but are
+/// still near-universal in any spoken corpus regardless of topic).
+/// This isn't about phrase position -- it's the same problem TF-IDF's
+/// inverse-document-frequency term exists to solve (down-weight what's
+/// common across language generally, not just within one document),
+/// approximated here without a general-corpus baseline: a phrase only
+/// counts as signal if it contains at least one word NOT on this list
+/// anywhere in it, regardless of position.
+const COMMON_WORDS: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "but",
+    "so",
+    "to",
+    "of",
+    "in",
+    "on",
+    "at",
+    "is",
+    "was",
+    "are",
+    "were",
+    "be",
+    "been",
+    "being",
+    "i",
+    "you",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "this",
+    "that",
+    "these",
+    "those",
+    "with",
+    "for",
+    "as",
+    "if",
+    "then",
+    "than",
+    "not",
+    "just",
+    "like",
+    "um",
+    "uh",
+    "i'm",
+    "i've",
+    "i'll",
+    "i'd",
+    "you're",
+    "you've",
+    "you'll",
+    "you'd",
+    "he's",
+    "she's",
+    "it's",
+    "we're",
+    "we've",
+    "they're",
+    "they've",
+    "that's",
+    "there's",
+    "what's",
+    "who's",
+    "don't",
+    "doesn't",
+    "didn't",
+    "won't",
+    "wouldn't",
+    "can't",
+    "couldn't",
+    "isn't",
+    "aren't",
+    "wasn't",
+    "weren't",
+    "haven't",
+    "hasn't",
+    "hadn't",
+    "shouldn't",
+    "get",
+    "got",
+    "getting",
+    "go",
+    "going",
+    "goes",
+    "went",
+    "do",
+    "does",
+    "did",
+    "doing",
+    "have",
+    "has",
+    "had",
+    "having",
+    "make",
+    "makes",
+    "made",
+    "know",
+    "knows",
+    "knew",
+    "think",
+    "thinks",
+    "thought",
+    "want",
+    "wants",
+    "wanted",
+    "say",
+    "says",
+    "said",
+    "see",
+    "sees",
+    "saw",
+    "look",
+    "looks",
+    "looked",
+    "come",
+    "comes",
+    "came",
+    "take",
+    "takes",
+    "took",
+    "really",
+    "very",
+    "all",
+    "out",
+    "up",
+    "down",
+    "about",
+    "into",
+    "over",
+    "again",
+    "here",
+    "there",
+    "when",
+    "what",
+    "where",
+    "why",
+    "how",
+    "who",
+    "which",
+    "some",
+    "any",
+    "no",
+    "yes",
+    "one",
+    "two",
+    "lot",
+    "bit",
+    "little",
+    "much",
+    "more",
+    "most",
+    "other",
+    "own",
+    "same",
+    "such",
+    "also",
+    "even",
+    "still",
+    "back",
+    "way",
+    "well",
+    "now",
+    "day",
+    "days",
+    "time",
+    "times",
+    "thing",
+    "things",
+    "people",
+];
+
 fn is_stopword(word: &str) -> bool {
     STOPWORDS.contains(&word)
+}
+
+fn is_common(word: &str) -> bool {
+    COMMON_WORDS.contains(&word)
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -88,6 +274,13 @@ fn count_ngrams(
             };
             let Some(last) = window.last() else { continue };
             if is_stopword(first) || is_stopword(last) {
+                continue;
+            }
+            // Reject a phrase if every word in it is generic/common --
+            // edge-trimming alone isn't enough (see COMMON_WORDS' doc
+            // comment); real signal needs at least one distinctive word
+            // ANYWHERE in the phrase, not just at the boundaries.
+            if window.iter().all(|w| is_common(w)) {
                 continue;
             }
             let phrase = window.join(" ");
@@ -257,6 +450,33 @@ mod tests {
         assert_eq!(top.term, "purpose stack");
         assert_eq!(top.distinct_files, 3);
         assert_eq!(top.total_occurrences, 3);
+    }
+
+    #[test]
+    fn a_phrase_made_entirely_of_generic_words_is_excluded_even_without_edge_stopwords() {
+        let tmp = tempfile::tempdir().unwrap();
+        let person_dir = tmp.path().join("filler-heavy");
+        std::fs::create_dir_all(&person_dir).unwrap();
+
+        // Real bug found scanning Roy Sugarman's corpus: "you've got" and
+        // "how do" dominated the whole ranking. Neither word is a
+        // STOPWORD-list edge match ("you've"/"got" aren't in the narrow
+        // edge-trim list), but both are generic across any spoken
+        // corpus regardless of topic -- this must be excluded by the
+        // broader COMMON_WORDS "at least one distinctive word" filter.
+        for i in 0..3 {
+            write_sidecar(
+                &person_dir,
+                &format!("f{i}.dedup.json"),
+                "you've got to really think about how do you make this work.",
+            );
+        }
+
+        let entries = scan(tmp.path(), "filler-heavy").expect("scan should succeed");
+        for entry in &entries {
+            assert_ne!(entry.term, "you've got");
+            assert_ne!(entry.term, "how do");
+        }
     }
 
     #[test]
