@@ -58,6 +58,21 @@ enum Commands {
         #[arg(long, default_value = "direct")]
         source: String,
     },
+    /// Stage a persona-build handover from an external tool's payload
+    /// manifest — the whole trm/persona boundary (ADR-0009): a caller
+    /// hands trm one JSON file, trm owns every internal detail of how
+    /// it becomes a pending job. Manifest shape:
+    /// `{ slug, bank, description, source_label, self_build, artifacts: [paths] }`
+    /// -- `artifacts` is untyped from trm's side, just "files worth a
+    /// sub-agent reading" (dedup sidecars, cluster/lexicon output,
+    /// whatever the caller produced). `--bank` (the global flag) is an
+    /// override; the manifest's own `bank` field is used otherwise --
+    /// no cwd-based resolution, since an external caller has no
+    /// meaningful cwd relationship to a bank.
+    StagePersona {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     /// List open handover jobs in the resolved bank, or every bank with --all.
     Pending {
         #[arg(long)]
@@ -1207,6 +1222,18 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::StagePersona { manifest } => {
+            match stage_persona(&data_root, cli.bank.as_deref(), &manifest) {
+                Ok(job_id) => {
+                    println!("staged: {job_id}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm stage-persona failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Commands::ClusterIndex { action } => {
             let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
             let paths = bank::paths_for(&data_root, &bank_id);
@@ -1375,6 +1402,92 @@ fn stage(
     fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
     let _guard = lock::acquire(&paths.root).map_err(|e| e.to_string())?;
     handover::stage(&paths, content, reason, source).map_err(|e| e.to_string())
+}
+
+/// The persona payload manifest's required shape (ADR-0009) -- parsed
+/// with plain `serde_json::Value` field access, matching this crate's
+/// existing convention (no `serde` derive dependency, only
+/// `serde_json`).
+struct PersonaManifest {
+    slug: String,
+    bank: String,
+    description: String,
+    source_label: String,
+    self_build: bool,
+    artifacts: Vec<PathBuf>,
+}
+
+fn parse_persona_manifest(raw: &str) -> Result<PersonaManifest, String> {
+    let json: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("manifest is not valid JSON: {e}"))?;
+
+    let field = |name: &str| -> Result<String, String> {
+        json.get(name)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("manifest missing required string field {name:?}"))
+    };
+
+    let artifacts_json = json
+        .get("artifacts")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "manifest missing required array field \"artifacts\"".to_string())?;
+    let artifacts: Vec<PathBuf> = artifacts_json
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| "manifest \"artifacts\" entries must all be strings".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    if artifacts.is_empty() {
+        return Err(
+            "manifest \"artifacts\" must not be empty -- nothing for a sub-agent to read"
+                .to_string(),
+        );
+    }
+
+    Ok(PersonaManifest {
+        slug: field("slug")?,
+        bank: field("bank")?,
+        description: field("description")?,
+        source_label: field("source_label")?,
+        self_build: json
+            .get("self_build")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        artifacts,
+    })
+}
+
+/// Stage a persona-build handover from an external caller's manifest
+/// file. `explicit_bank` (the global `--bank` flag) overrides the
+/// manifest's own `bank` field when given -- otherwise the manifest is
+/// self-contained, since an external tool (e.g. `persona`) has no
+/// cwd-based relationship to a bank the way an in-repo `trm` invocation
+/// does.
+fn stage_persona(
+    data_root: &std::path::Path,
+    explicit_bank: Option<&str>,
+    manifest_path: &std::path::Path,
+) -> Result<String, String> {
+    let raw = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("failed to read manifest {}: {e}", manifest_path.display()))?;
+    let manifest = parse_persona_manifest(&raw)?;
+
+    let bank_id = explicit_bank.map(str::to_string).unwrap_or(manifest.bank);
+    let paths = bank::paths_for(data_root, &bank_id);
+    fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
+    let _guard = lock::acquire(&paths.root).map_err(|e| e.to_string())?;
+    handover::stage_persona_sources(
+        &paths,
+        &manifest.slug,
+        manifest.artifacts,
+        &manifest.description,
+        &manifest.source_label,
+        manifest.self_build,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// What `ingest_session` actually did — `main()`'s match arm reports this
