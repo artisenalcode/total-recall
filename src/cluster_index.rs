@@ -67,11 +67,24 @@ fn blob_to_embedding(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Same floor squishi's own `dedupe()` uses (`MIN_WORDS` in
+/// `semantic_dedup.rs`) -- sentences shorter than this are never
+/// paraphrase-compared there either, just auto-kept as-is into each
+/// sidecar's `kept` array. Real bug found pressure-testing against
+/// Roy's corpus (2026-08-10): without this floor, short interview
+/// filler ("Yeah.", "Mhm.", "Thank you.") swamped every substantive
+/// cluster -- near-identical short utterances trivially cluster to
+/// huge sizes across a multi-video corpus, drowning out real recurring
+/// content. Applying the same floor here keeps the index scoped to
+/// what squishi itself considers meaningfully comparable.
+const MIN_WORDS: usize = 8;
+
 /// Reads every `.dedup.json` sidecar's `kept` array for `slug` and
-/// returns `(source_file, text, shape)` triples, sorted by sidecar
-/// filename for determinism. Requires squishi's `kept` field (per-file
-/// `dedup-raw` must have already run against a squishi build that emits
-/// it) -- errors clearly if no sidecars exist at all.
+/// returns `(source_file, text, shape)` triples for sentences meeting
+/// `MIN_WORDS`, sorted by sidecar filename for determinism. Requires
+/// squishi's `kept` field (per-file `dedup-raw` must have already run
+/// against a squishi build that emits it) -- errors clearly if no
+/// sidecars exist at all.
 fn read_kept_sentences(
     raw_dir: &Path,
     slug: &str,
@@ -121,6 +134,9 @@ fn read_kept_sentences(
             ) else {
                 continue;
             };
+            if text.split_whitespace().count() < MIN_WORDS {
+                continue;
+            }
             rows.push((source_file.clone(), text.to_string(), shape.to_string()));
         }
     }
@@ -339,6 +355,29 @@ mod tests {
         let result = up(tmp.path(), "no-sidecars-yet");
         let err = result.expect_err("should error without any .dedup.json sidecars");
         assert!(err.contains("dedup-raw"));
+    }
+
+    #[test]
+    fn read_kept_sentences_excludes_short_filler_below_min_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        let person_dir = tmp.path().join("has-filler");
+        std::fs::create_dir_all(&person_dir).unwrap();
+        write_sidecar(
+            &person_dir,
+            "yt-abc.dedup.json",
+            &[
+                ("Yeah.", "concept"),
+                ("Mhm.", "concept"),
+                (
+                    "This sentence has more than eight words in it easily.",
+                    "concept",
+                ),
+            ],
+        );
+
+        let rows = read_kept_sentences(tmp.path(), "has-filler").unwrap();
+        assert_eq!(rows.len(), 1, "short filler should be excluded: {rows:?}");
+        assert!(rows[0].1.contains("more than eight words"));
     }
 
     #[test]
