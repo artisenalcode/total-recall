@@ -1,6 +1,7 @@
 mod archive;
 mod atomic;
 mod bank;
+mod cluster_index;
 mod concepts;
 mod config;
 mod curator;
@@ -267,16 +268,38 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Cross-file recurrence clustering: pools every already-deduped
-    /// source file's `.dedup.json` sidecar for a slug into one document
-    /// and runs squishi's dedup once more over the pool. Squishi's
-    /// existing greedy clustering does the work -- each dropped sentence
-    /// records which survivor it collapsed into, so counting drops per
-    /// survivor gives a mechanical recurrence score, no LLM involved.
-    /// Requires `dedup-raw` to have already run for this slug. Writes
+    /// Build or tear down a throwaway per-corpus SQLite embedding index
+    /// (`<raw>/<slug>/cluster.sqlite`) used by `cluster-raw` for
+    /// cross-file recurrence clustering. `up` embeds every kept sentence
+    /// from every `.dedup.json` sidecar for the slug (requires
+    /// `dedup-raw` to have already run); `down` deletes the index --
+    /// exactly as disposable as the raw tier it's built from. Separated
+    /// from `cluster-raw` itself so multiple queries/passes can run
+    /// against one built index without re-embedding each time.
+    ClusterIndex {
+        #[command(subcommand)]
+        action: ClusterIndexAction,
+    },
+    /// Cross-file recurrence clustering, queried from an index already
+    /// built via `cluster-index up`. Unbounded comparison across the
+    /// whole corpus (no positional window, unlike squishi's own
+    /// single-document dedup) -- the mechanical proxy for "what does
+    /// this person keep coming back to," no LLM involved. Writes
     /// `<raw>/<slug>/cluster-summary.json` (topics + recurring stories,
     /// ranked by cluster_size).
     ClusterRaw {
+        #[arg(long)]
+        slug: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClusterIndexAction {
+    Up {
+        #[arg(long)]
+        slug: String,
+    },
+    Down {
         #[arg(long)]
         slug: String,
     },
@@ -1169,10 +1192,36 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::ClusterIndex { action } => {
+            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            let paths = bank::paths_for(&data_root, &bank_id);
+            match action {
+                ClusterIndexAction::Up { slug } => match cluster_index::up(&paths.raw, &slug) {
+                    Ok(path) => {
+                        println!("cluster-index up: wrote {}", path.display());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("trm cluster-index up failed: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                ClusterIndexAction::Down { slug } => match cluster_index::down(&paths.raw, &slug) {
+                    Ok(()) => {
+                        println!("cluster-index down: removed index for {slug:?}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("trm cluster-index down failed: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+            }
+        }
         Commands::ClusterRaw { slug } => {
             let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
             let paths = bank::paths_for(&data_root, &bank_id);
-            match persona::cluster_raw_files(&paths.raw, &slug) {
+            match cluster_index::write_summary(&paths.raw, &slug) {
                 Ok(path) => {
                     println!("cluster-raw: wrote {}", path.display());
                     ExitCode::SUCCESS
