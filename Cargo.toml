@@ -14,7 +14,6 @@ flate2 = "1.0"
 fastembed = { version = "5.17.4", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls", "image-models"] }
 serde_json = "1"
 ureq = "3.3.0"
-rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

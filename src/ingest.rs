@@ -32,8 +32,8 @@ pub struct SessionDigest {
 
 /// Parse `squishi --session-digest ... --json`'s real output shape.
 /// Pure and independently testable — the subprocess call itself
-/// (`run_squishi_session_digest`) is a thin wrapper around this plus
-/// real process I/O, exercised by the black-box CLI tests instead.
+/// (`run_squishi_session_digest_from`) is a thin wrapper around this
+/// plus real process I/O, exercised by the black-box CLI tests instead.
 pub fn parse_squishi_json(json_str: &str) -> Result<SessionDigest, String> {
     let value: Value =
         serde_json::from_str(json_str).map_err(|e| format!("invalid JSON from squishi: {e}"))?;
@@ -78,19 +78,13 @@ pub fn build_reason(digest: &SessionDigest) -> String {
     )
 }
 
-/// Spawn `squishi --session-digest <path> --json` (whole-file, `--start-line
-/// 0`) and parse its output. Thin wrapper over `run_squishi_session_digest_from`
-/// — unchanged behavior for every existing caller.
-pub fn run_squishi_session_digest(path: &Path) -> Result<SessionDigest, String> {
-    run_squishi_session_digest_from(path, 0)
-}
-
-/// Same as `run_squishi_session_digest`, but with an explicit `--start-line`
-/// (ADR-0006 Phase 2) — an incremental caller passes the session's saved
-/// `last_staged_line` here and gets back only the delta. Real process I/O
-/// — not unit-tested directly (mocking a subprocess call buys nothing
-/// real); covered by the black-box CLI tests instead, same discipline as
-/// every other real-subprocess boundary in this project.
+/// Spawn `squishi --session-digest <path> --start-line <n> --json` and
+/// parse its output. `start_line` is 0 for a whole-file digest; an
+/// incremental caller (ADR-0006 Phase 2) passes the session's saved
+/// `last_staged_line` here and gets back only the delta. Real process
+/// I/O — not unit-tested directly (mocking a subprocess call buys
+/// nothing real); covered by the black-box CLI tests instead, same
+/// discipline as every other real-subprocess boundary in this project.
 pub fn run_squishi_session_digest_from(
     path: &Path,
     start_line: usize,

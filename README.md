@@ -49,36 +49,17 @@ at the repo root > git remote (owner/repo slug) > path hash > `global`.
 
 ## Persona ingestion
 
-```bash
-trm ingest-persona --person "Full Name" --slug the-slug \
-  --channel https://www.youtube.com/@SomeChannel --max-videos 50 \
-  --wikipedia "Full Name" \
-  --git-repo https://github.com/owner/repo --git-author name@example.com --github-user handle \
-  --website https://example.com/about
-```
-
-Source types: `--video`/`--channel` (YouTube, via `yt-dlp`), `--wikipedia`
-(MediaWiki API), `--git-repo`+`--git-author` (commit messages, via a
-blobless clone) and `--git-repo`+`--github-user` (issues/PRs authored by a
-real GitHub login, via `gh api search/issues` — a different identifier
-than `--git-author`'s email, since GitHub matches issues by account, not
-commit-trailer email), `--website` (a real page fetch via the locally
-installed `agent-browser` CLI — real browser rendering, so JS-heavy pages
-work where a plain HTTP GET would return nothing), and `--session` (the
-user's own Claude Code transcripts, always routed to the `self` bank —
-see ADR-0007, can't be combined with the advisor sources above in one
-call). Every pathway is mechanical fetch+clean+stage only — `trm` never
-calls an LLM itself (ADR-0002); read the staged handover with
-`trm pending-show <job-id>` and synthesize it yourself.
-
-For many people at once (`scripts/bulk-ingest-personas.sh <roster-file>
-[-p bank]`): a pipe-delimited roster file, one persona per line
-(`<slug>|<Person Name>|<extra ingest-persona args>`), looped with
-per-persona resilience (one failure doesn't abort the batch), followed
-by one `trm curator-scan` pass across the whole bank for cross-persona
-dedup. See the script's own header comment for the roster format and a
-real limitation (`--video`'s `id|title` syntax collides with the
-roster's own `|` delimiter — use `--channel` in a roster instead).
+Persona ingestion (YouTube/Wikipedia/git/website fetching, dedup,
+cross-file clustering, lexicon-scan) lives in the standalone
+[`persona`](https://github.com/artisenalcode/persona) repo now — a
+SQL-first pipeline with no library dependency on `trm`. `trm`'s only
+remaining role in that pipeline is the receiving side of the handover
+contract: `persona`'s own `stage-synthesis` command shells out to
+`trm stage-persona --manifest <path>`, which stages a `PersonaBuild`
+handover exactly like any other — read it with `trm pending-show
+<job-id>` and synthesize it yourself, then `trm complete-handover
+<job-id> "<result>"` same as any other handover kind. See `persona`'s
+own README for the actual ingestion commands.
 
 ## Development
 

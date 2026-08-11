@@ -1,7 +1,6 @@
 mod archive;
 mod atomic;
 mod bank;
-mod cluster_index;
 mod concepts;
 mod config;
 mod curator;
@@ -10,10 +9,7 @@ mod embed_cache;
 mod embeddings;
 mod handover;
 mod ingest;
-mod lexicon;
-mod lexicon_common_words;
 mod lock;
-mod persona;
 mod session_checkpoint;
 mod wiki;
 mod window;
@@ -181,157 +177,6 @@ enum Commands {
         /// hook exits 0 silently rather than staging anyway.
         #[arg(long, value_enum, default_value = "manual")]
         trigger: Trigger,
-    },
-    /// Fetch+clean YouTube auto-captions for a person's videos and stage
-    /// a PersonaBuild handover for a sub-agent to synthesize into a
-    /// persona wiki page. Mechanical only (fetch/clean/stage) -- trm
-    /// never calls an LLM itself, per ADR-0002; synthesis is the
-    /// sub-agent's job once `trm pending-show <job-id>` is read.
-    IngestPersona {
-        #[arg(long)]
-        person: String,
-        #[arg(long)]
-        slug: String,
-        /// Repeatable: "<video_id>|<title>", e.g. --video
-        /// "dQw4w9WgXcQ|A Real Talk Title". Hand-picked -- for
-        /// full-channel enumeration see --channel instead. Not required
-        /// on its own -- not every persona has a YouTube corpus (see
-        /// --wikipedia); at least one source across all flags is
-        /// required. allow_hyphen_values: a real YouTube video ID can
-        /// start with '-' (found 2026-08-09, e.g. "-EMKMPxJrWY") --
-        /// without this, clap misreads "--video -EMKMPxJrWY|title" as
-        /// an unknown "-E..." flag under space-separated invocation.
-        #[arg(long = "video", allow_hyphen_values = true)]
-        videos: Vec<String>,
-        /// Repeatable: a channel URL, e.g.
-        /// "https://www.youtube.com/@SomeChannel/videos". Enumerates
-        /// (not downloads-in-full) up to --max-videos of the channel's
-        /// most recent uploads via `yt-dlp --flat-playlist`, merged
-        /// into the same video list --video populates. Fills the gap
-        /// --video's doc comment used to call out (no full-channel
-        /// enumeration existed in this tool before 2026-08-09) --
-        /// previously worked around with an external script translating
-        /// yt-dlp's own enumeration output into a wall of --video flags.
-        #[arg(long = "channel")]
-        channels: Vec<String>,
-        /// Cap on videos enumerated per --channel (ignored for --video,
-        /// which is already an explicit hand-picked list).
-        #[arg(long = "max-videos", default_value_t = 50)]
-        max_videos: usize,
-        /// Repeatable: a Wikipedia article title, e.g. "Jordan Peterson".
-        /// Fetched via the official MediaWiki API (plain-text extract,
-        /// no scraping) -- no auth, no rate-limit concerns for a handful
-        /// of titles.
-        #[arg(long = "wikipedia")]
-        wikipedia: Vec<String>,
-        /// A single git repo URL to pull commit messages from (one repo
-        /// per invocation, same scope as `advisory`'s own code-
-        /// archaeology ingester -- run again for a second repo).
-        /// Requires --git-author at least once.
-        #[arg(long = "git-repo")]
-        git_repo: Option<String>,
-        /// Repeatable: an author email to match commits by (same person
-        /// often uses more than one email across repos/years).
-        #[arg(long = "git-author")]
-        git_author: Vec<String>,
-        /// Repeatable: a real GitHub login (not an email -- GitHub's
-        /// issue-search API matches by account, not commit-trailer
-        /// email) to pull authored issues/PRs for. Requires --git-repo
-        /// (a GitHub URL specifically -- issue search is GitHub-only,
-        /// unlike --git-repo/--git-author's plain `git log`, which works
-        /// against any host).
-        #[arg(long = "github-user")]
-        github_user: Vec<String>,
-        /// Repeatable: a URL to fetch via the locally installed
-        /// `agent-browser` CLI (real browser rendering, so JS-heavy
-        /// pages work -- unlike a plain HTTP GET, which silently
-        /// returns nothing useful for a JS-rendered page). For a
-        /// personal site/blog source.
-        #[arg(long = "website")]
-        website: Vec<String>,
-        /// Repeatable: a path to a Claude Code session transcript
-        /// (plain `.jsonl`, or a `sessions/<id>.jsonl.gz` archive --
-        /// both accepted transparently). ADR-0007: builds the USER'S
-        /// OWN self-persona from real session content, not a
-        /// third-party advisor -- always stages into the fixed `self`
-        /// bank regardless of cwd/`-p`, and cannot be combined with
-        /// `--video`/`--wikipedia`/`--git-repo` in the same call.
-        #[arg(long = "session")]
-        sessions: Vec<PathBuf>,
-        #[arg(long, default_value = "direct")]
-        source: String,
-    },
-    /// Standalone dedup/punctuation-restoration pass over raw files
-    /// already on disk for a slug -- no fetching, no network beyond
-    /// what squishi itself needs for its models. The explicit answer to
-    /// "fetch in batches, then transform separately": re-runnable
-    /// anytime after `ingest-persona`, safe to retry, skips files that
-    /// already have a `.dedup.json` sidecar unless --force is given.
-    DedupRaw {
-        #[arg(long)]
-        slug: String,
-        #[arg(long)]
-        force: bool,
-    },
-    /// Sentence-level concept distillation over whatever raw files
-    /// already exist for a slug -- the trm-native port of `advisory/
-    /// tools/dedupe_semantic.py`, producing a much smaller per-file
-    /// `.concepts.json` sidecar of unique-concept sentences alongside
-    /// (not instead of) `dedup-raw`'s coarser output. Re-runnable
-    /// anytime, skips files that already have a sidecar unless --force.
-    ExtractConcepts {
-        #[arg(long)]
-        slug: String,
-        #[arg(long)]
-        force: bool,
-    },
-    /// Build or tear down a throwaway per-corpus SQLite embedding index
-    /// (`<raw>/<slug>/cluster.sqlite`) used by `cluster-raw` for
-    /// cross-file recurrence clustering. `up` embeds every kept sentence
-    /// from every `.dedup.json` sidecar for the slug (requires
-    /// `dedup-raw` to have already run); `down` deletes the index --
-    /// exactly as disposable as the raw tier it's built from. Separated
-    /// from `cluster-raw` itself so multiple queries/passes can run
-    /// against one built index without re-embedding each time.
-    ClusterIndex {
-        #[command(subcommand)]
-        action: ClusterIndexAction,
-    },
-    /// Cross-file recurrence clustering, queried from an index already
-    /// built via `cluster-index up`. Unbounded comparison across the
-    /// whole corpus (no positional window, unlike squishi's own
-    /// single-document dedup) -- the mechanical proxy for "what does
-    /// this person keep coming back to," no LLM involved. Writes
-    /// `<raw>/<slug>/cluster-summary.json` (topics + recurring stories,
-    /// ranked by cluster_size).
-    ClusterRaw {
-        #[arg(long)]
-        slug: String,
-    },
-    /// Mechanical, model-free concept-recurrence scan: counts 2-4 word
-    /// phrases across every source file's `.dedup.json` text, ranked by
-    /// how many distinct source files a phrase appears in. Catches
-    /// named recurring terms/frameworks that `cluster-raw`'s sentence-
-    /// embedding clustering can't -- a person re-explaining the same
-    /// concept in different words each time never clusters at the
-    /// sentence level, but a named term they keep returning to ("DARN-
-    /// C", "the purpose stack") recurs literally. No embedding model,
-    /// no network. Writes `<raw>/<slug>/lexicon.json`.
-    LexiconScan {
-        #[arg(long)]
-        slug: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ClusterIndexAction {
-    Up {
-        #[arg(long)]
-        slug: String,
-    },
-    Down {
-        #[arg(long)]
-        slug: String,
     },
 }
 
@@ -546,48 +391,21 @@ compaction. Install globally in `~/.claude/settings.json`'s `hooks.PreCompact`
 (matcher `"manual|auto"`, matching both trigger sources) to cover every
 project, or per-project in that repo's own `.claude/settings.json`.
 
-## Ingest a persona (build an advisor from YouTube)
+## Ingest a persona (build an advisor from YouTube/Wikipedia/git/web)
 
-    trm ingest-persona --person "Full Name" --slug the-slug \
-        --video "abc123|A Real Video Title" --video "def456|Another Title"
-
-Fetches+cleans YouTube auto-captions for each `--video` (real `yt-dlp`
-subprocess). If `yt-dlp` isn't on PATH, a standalone binary is
-downloaded once (real HTTP GET via `ureq`, no async runtime, no GPL
-code linked into this binary -- the downloaded executable is the same
-external tool either way) and cached at `<data_root>/bin/yt-dlp` for
-every future call. Writes one raw transcript file per video into the
-resolved bank's raw tier (same frontmatter shape as
-`advisory/tools/ingest_youtube.py`, so existing wiki-reading tooling needs
-no changes), then stages a `PersonaBuild` handover — **never concept-
-split** (that's the wrong shape for this job; see `handover.rs`'s own
-doc comment on why, dated 2026-08-07). `trm pending-show <job-id>` prints
-the real, embedded synthesis criteria (co-developed with a real clinical-
-psychology advisor in this store) for the sub-agent completing the job.
-Mechanical only — trm never calls an LLM itself, per ADR-0002; synthesis
-happens when a sub-agent reads the pending prompt and writes the actual
-wiki page via `trm complete-handover`.
-
-**`--session` (ADR-0007): the user's own self-persona, from real session
-transcripts.**
-
-    trm ingest-persona --person "Full Name" --slug the-slug \
-        --session ~/.claude/projects/.../sess-a.jsonl \
-        --session ~/.trm/banks/some-project/sessions/sess-b.jsonl.gz
-
-Repeatable, hand-picked (no bulk/glob mode) — accepts both a plain
-`.jsonl` transcript and the archived `sessions/<id>.jsonl.gz` format
-(ADR-0006) transparently, gzip-detected by extension. Reuses squishi's
-`--session-digest` wholesale for extraction — no separate self-voice-only
-pass. Always stages into the fixed `self` bank, ignoring `-p`/`--bank`
-and the session's own cwd entirely (prints an informational note if `-p`
-was also passed) — the one source type here where "whatever bank you're
-standing in" is wrong. It cannot be combined with `--video`/`--wikipedia`/
-`--git-repo` in the same call (hard error). The staged `PersonaBuild`
-handover renders self-persona-framed criteria, not the third-party-
-advisor framing `--video`/`--wikipedia`/`--git-repo` get — item #3
-("personally-supplied relational layer") doesn't apply when the subject
-IS the requester.
+Persona ingestion lives in the standalone `persona` repo now (SQL-first
+pipeline, no library dependency on trm) — see that repo's own README for
+the actual ingestion commands. trm's only remaining role is the
+receiving side of the handover contract: `persona`'s `stage-synthesis`
+shells out to `trm stage-persona --manifest <path>`, which stages a
+`PersonaBuild` handover exactly like any other — **never concept-split**
+(that's the wrong shape for this job; see `handover.rs`'s own doc
+comment on why, dated 2026-08-07). `trm pending-show <job-id>` prints
+the real, embedded synthesis criteria (co-developed with a real
+clinical-psychology advisor in this store) for the sub-agent completing
+the job. Mechanical only — trm never calls an LLM itself, per ADR-0002;
+synthesis happens when a sub-agent reads the pending prompt and writes
+the actual wiki page via `trm complete-handover`.
 
 ## Where facts live
 
@@ -599,11 +417,13 @@ but not yet processed (empty until ingestion pathways exist).
 ## What trm does not do (yet)
 
 Claude Code session ingestion is real now (`trm ingest-session`, above).
-No ingestion pathways for repo scan, YouTube, or web scrape (`code
-archaeology`/`youtube`/`web-scrape` per CONTEXT.md's resolved-but-unbuilt
-pathway list) — still true. `docs/chat-exports/`-style bulk sources have
-the mechanism (stage + concept pre-split) but no dedicated ingestion
-script wired to it yet. Kimi Code session ingestion is explicitly
+Repo scan, YouTube, and web scrape ingestion exist now too, but not in
+trm itself — that's the standalone `persona` repo, which only touches
+trm at the handover boundary (`stage-persona`/`pending-show`/
+`complete-handover`); no ingestion logic for any of that lives in this
+binary. `docs/chat-exports/`-style bulk sources have the mechanism
+(stage + concept pre-split) but no dedicated ingestion script wired to
+it yet. Kimi Code session ingestion is explicitly
 deferred (Claude Code proven first, per the user's own sequencing call)
 — real Kimi session data exists on disk, nothing reads it into trm yet.
 "#;
@@ -893,335 +713,6 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Commands::IngestPersona {
-            person,
-            slug,
-            videos,
-            channels,
-            max_videos,
-            wikipedia,
-            git_repo,
-            git_author,
-            github_user,
-            website,
-            sessions,
-            source,
-        } => {
-            let has_advisor_source = !videos.is_empty()
-                || !channels.is_empty()
-                || !wikipedia.is_empty()
-                || git_repo.is_some()
-                || !website.is_empty();
-            if !has_advisor_source && sessions.is_empty() {
-                eprintln!(
-                    "trm ingest-persona failed: at least one source is required (--video, --channel, --wikipedia, --git-repo, --website, or --session)"
-                );
-                return ExitCode::FAILURE;
-            }
-            if git_repo.is_some() && git_author.is_empty() && github_user.is_empty() {
-                eprintln!(
-                    "trm ingest-persona failed: --git-repo requires at least one --git-author or --github-user"
-                );
-                return ExitCode::FAILURE;
-            }
-            if !github_user.is_empty() && git_repo.is_none() {
-                eprintln!("trm ingest-persona failed: --github-user requires --git-repo");
-                return ExitCode::FAILURE;
-            }
-            // ADR-0007: --session builds the user's own self-persona from
-            // real session content -- a fundamentally different corpus
-            // than an advisor's public-record sources, always routed to
-            // a different bank (see below). Mixing the two in one call
-            // would blur that distinction, so it's a hard error rather
-            // than silently staging advisor + self content together.
-            if !sessions.is_empty() && has_advisor_source {
-                eprintln!(
-                    "trm ingest-persona failed: --session cannot be combined with \
-                     --video/--channel/--wikipedia/--git-repo/--website in the same call"
-                );
-                return ExitCode::FAILURE;
-            }
-
-            let parsed: Result<Vec<persona::VideoTarget>, String> = videos
-                .iter()
-                .map(|v| match v.split_once('|') {
-                    Some((id, title)) => Ok(persona::VideoTarget {
-                        id: id.to_string(),
-                        title: title.to_string(),
-                    }),
-                    None => Err(format!(
-                        "invalid --video {v:?}, expected \"<video_id>|<title>\""
-                    )),
-                })
-                .collect();
-            let mut videos = match parsed {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("trm ingest-persona failed: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-
-            // --channel: enumerate each channel's most recent max_videos
-            // uploads and merge them in, deduping against any explicit
-            // --video entries for the same id (an explicit hand-picked
-            // --video always wins -- it's more deliberate than whatever
-            // the channel enumeration happened to include).
-            if !channels.is_empty() {
-                let yt_dlp_bin = match persona::ensure_yt_dlp(&data_root) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("trm ingest-persona failed: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let mut seen: std::collections::HashSet<String> =
-                    videos.iter().map(|v| v.id.clone()).collect();
-                for channel in &channels {
-                    match persona::enumerate_channel_videos(&yt_dlp_bin, channel, max_videos) {
-                        Ok(enumerated) => {
-                            println!(
-                                "--channel {channel:?}: {} video(s) enumerated",
-                                enumerated.len()
-                            );
-                            for v in enumerated {
-                                if seen.insert(v.id.clone()) {
-                                    videos.push(v);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("trm ingest-persona: --channel {channel:?} failed: {e}");
-                        }
-                    }
-                }
-            }
-
-            // --session always stages into the fixed self bank (ADR-0007
-            // Decision 2) -- -p/--bank's normal override doesn't apply
-            // here, since routing self-persona content elsewhere would
-            // defeat the point. An explicit -p alongside --session is
-            // not an error, just informational: the user may not expect
-            // it to be silently ignored.
-            let bank_id = if !sessions.is_empty() {
-                if cli.bank.is_some() {
-                    eprintln!(
-                        "note: -p/--bank is ignored for --session sources -- always stages \
-                         into the {:?} bank",
-                        persona::SELF_PERSONA_BANK
-                    );
-                }
-                persona::SELF_PERSONA_BANK.to_string()
-            } else {
-                bank::resolve_bank_id(cli.bank.as_deref(), &cwd)
-            };
-            let paths = bank::paths_for(&data_root, &bank_id);
-            if let Err(e) = fs::create_dir_all(&paths.root) {
-                eprintln!("trm ingest-persona failed: {e}");
-                return ExitCode::FAILURE;
-            }
-            let _guard = match lock::acquire(&paths.root) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("trm ingest-persona failed: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-
-            let today = today_date();
-            let mut source_paths = Vec::new();
-
-            if !videos.is_empty() {
-                match persona::ingest_videos(
-                    &data_root, &paths.raw, &person, &slug, &videos, &today,
-                ) {
-                    Ok((mut paths, failures)) => {
-                        let succeeded = paths.len();
-                        source_paths.append(&mut paths);
-                        for (id, e) in &failures {
-                            eprintln!("warning: video {id} failed, skipped: {e}");
-                        }
-                        if !failures.is_empty() {
-                            eprintln!(
-                                "video source: {succeeded}/{} succeeded ({} skipped -- \
-                                 re-run the same command to retry just the failures, \
-                                 already-fetched videos won't be re-fetched)",
-                                succeeded + failures.len(),
-                                failures.len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("trm ingest-persona failed (video source): {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            if !wikipedia.is_empty() {
-                match persona::ingest_wikipedia_pages(
-                    &paths.raw, &person, &slug, &wikipedia, &today,
-                ) {
-                    Ok(mut paths) => source_paths.append(&mut paths),
-                    Err(e) => {
-                        eprintln!("trm ingest-persona failed (wikipedia source): {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            if let Some(repo_url) = &git_repo {
-                if !git_author.is_empty() {
-                    match persona::ingest_git_commits(
-                        &paths.raw,
-                        &person,
-                        &slug,
-                        repo_url,
-                        &git_author,
-                        &today,
-                    ) {
-                        Ok(mut paths) => source_paths.append(&mut paths),
-                        // Non-fatal: a multi-source call (e.g. also
-                        // --wikipedia/--website) shouldn't lose already-
-                        // fetched sources over one repo genuinely having
-                        // no matching commits for the given author(s) --
-                        // same resilience posture as --video/--website
-                        // below, not the "abort the whole call" behavior
-                        // this used to have.
-                        Err(e) => eprintln!("warning: git-commits source failed, skipped: {e}"),
-                    }
-                }
-                if !github_user.is_empty() {
-                    match persona::ingest_git_issues(
-                        &paths.raw,
-                        &person,
-                        &slug,
-                        repo_url,
-                        &github_user,
-                        &today,
-                    ) {
-                        Ok(mut paths) => source_paths.append(&mut paths),
-                        // Non-fatal for the same reason as git-commits
-                        // above -- a real, common case: the repo owner's
-                        // own repo often has zero issues *authored by*
-                        // them (issues are usually filed by others).
-                        Err(e) => eprintln!("warning: git-issues source failed, skipped: {e}"),
-                    }
-                }
-            }
-            if !website.is_empty() {
-                match persona::ingest_websites(&paths.raw, &person, &slug, &website, &today) {
-                    Ok((mut paths, failures)) => {
-                        let succeeded = paths.len();
-                        source_paths.append(&mut paths);
-                        for (url, e) in &failures {
-                            eprintln!("warning: website {url} failed, skipped: {e}");
-                        }
-                        if !failures.is_empty() {
-                            eprintln!(
-                                "website source: {succeeded}/{} succeeded ({} skipped)",
-                                succeeded + failures.len(),
-                                failures.len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("trm ingest-persona failed (website source): {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            if !sessions.is_empty() {
-                match persona::ingest_sessions(&paths.raw, &person, &slug, &sessions, &today) {
-                    Ok((mut paths, failures)) => {
-                        let succeeded = paths.len();
-                        source_paths.append(&mut paths);
-                        for (label, e) in &failures {
-                            eprintln!("warning: session {label} failed, skipped: {e}");
-                        }
-                        if !failures.is_empty() {
-                            eprintln!(
-                                "session source: {succeeded}/{} succeeded ({} skipped)",
-                                succeeded + failures.len(),
-                                failures.len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("trm ingest-persona failed (session source): {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-
-            // Every source that can fail independently (git-commits,
-            // git-issues) now does so non-fatally (see above) -- so this
-            // is the one place left that must catch "nothing usable
-            // came out of any source" before staging an empty handover.
-            if source_paths.is_empty() {
-                eprintln!(
-                    "trm ingest-persona failed: every requested source failed or matched nothing -- see warnings above"
-                );
-                return ExitCode::FAILURE;
-            }
-
-            {
-                let description = if !sessions.is_empty() {
-                    format!(
-                        "Build a self-persona wiki page for {person} from {} raw session source(s)",
-                        source_paths.len()
-                    )
-                } else {
-                    format!(
-                        "Build a persona wiki page for {person} from {} raw source(s)",
-                        source_paths.len()
-                    )
-                };
-                match handover::stage_persona_sources(
-                    &paths,
-                    &slug,
-                    source_paths,
-                    &description,
-                    &source,
-                    !sessions.is_empty(),
-                ) {
-                    Ok(job_id) => {
-                        println!("staged: {job_id}");
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => {
-                        eprintln!("trm ingest-persona failed: {e}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
-        }
-        Commands::DedupRaw { slug, force } => {
-            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
-            let paths = bank::paths_for(&data_root, &bank_id);
-            match persona::dedup_raw_files(&paths.raw, &slug, force) {
-                Ok(count) => {
-                    println!("dedup-raw: processed {count} raw file(s) for {slug:?}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("trm dedup-raw failed: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Commands::ExtractConcepts { slug, force } => {
-            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
-            let paths = bank::paths_for(&data_root, &bank_id);
-            match persona::extract_concepts_files(&paths.raw, &slug, force) {
-                Ok(count) => {
-                    println!("extract-concepts: processed {count} raw file(s) for {slug:?}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("trm extract-concepts failed: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Commands::StagePersona { manifest } => {
             match stage_persona(&data_root, cli.bank.as_deref(), &manifest) {
                 Ok(job_id) => {
@@ -1230,60 +721,6 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("trm stage-persona failed: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Commands::ClusterIndex { action } => {
-            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
-            let paths = bank::paths_for(&data_root, &bank_id);
-            match action {
-                ClusterIndexAction::Up { slug } => match cluster_index::up(&paths.raw, &slug) {
-                    Ok(path) => {
-                        println!("cluster-index up: wrote {}", path.display());
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => {
-                        eprintln!("trm cluster-index up failed: {e}");
-                        ExitCode::FAILURE
-                    }
-                },
-                ClusterIndexAction::Down { slug } => match cluster_index::down(&paths.raw, &slug) {
-                    Ok(()) => {
-                        println!("cluster-index down: removed index for {slug:?}");
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => {
-                        eprintln!("trm cluster-index down failed: {e}");
-                        ExitCode::FAILURE
-                    }
-                },
-            }
-        }
-        Commands::ClusterRaw { slug } => {
-            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
-            let paths = bank::paths_for(&data_root, &bank_id);
-            match cluster_index::write_summary(&paths.raw, &slug) {
-                Ok(path) => {
-                    println!("cluster-raw: wrote {}", path.display());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("trm cluster-raw failed: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Commands::LexiconScan { slug } => {
-            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
-            let paths = bank::paths_for(&data_root, &bank_id);
-            match lexicon::write_lexicon(&paths.raw, &slug) {
-                Ok(path) => {
-                    println!("lexicon-scan: wrote {}", path.display());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("trm lexicon-scan failed: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -1371,22 +808,6 @@ fn find_md_files(dir: &std::path::Path) -> io::Result<Vec<PathBuf>> {
     }
     found.sort();
     Ok(found)
-}
-
-/// Resolve the bank, acquire its lock, and stage raw content for a
-/// sub-agent handover. Returns the job id.
-/// `YYYY-MM-DD`, via the real system `date` command rather than a new
-/// dependency — this crate is Linux-only already (see `lock.rs`'s own
-/// doc comment), and every other external-fact need in this binary
-/// (yt-dlp, squishi) already goes through a real subprocess.
-fn today_date() -> String {
-    std::process::Command::new("date")
-        .arg("+%Y-%m-%d")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown-date".to_string())
 }
 
 fn stage(
@@ -1912,17 +1333,10 @@ mod tests {
     }
 
     #[test]
-    fn core_docs_covers_ingest_persona() {
-        assert!(CORE_DOCS.contains("trm ingest-persona"));
+    fn core_docs_covers_persona_handover_boundary() {
+        assert!(CORE_DOCS.contains("standalone `persona` repo"));
+        assert!(CORE_DOCS.contains("trm stage-persona"));
         assert!(CORE_DOCS.contains("PersonaBuild"));
-        assert!(CORE_DOCS.contains("bin/yt-dlp"));
-    }
-
-    #[test]
-    fn core_docs_covers_session_persona_source() {
-        assert!(CORE_DOCS.contains("--session"));
-        assert!(CORE_DOCS.contains("self"));
-        assert!(CORE_DOCS.contains("cannot be combined"));
     }
 
     #[test]
