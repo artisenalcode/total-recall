@@ -1,6 +1,7 @@
 mod archive;
 mod atomic;
 mod bank;
+mod ccr;
 mod concepts;
 mod config;
 mod curator;
@@ -119,6 +120,39 @@ enum Commands {
         /// mutation this command ever makes, and only with this flag.
         #[arg(long)]
         fix: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Store `content`'s bytes in the content-addressed recovery store and
+    /// print the handle. Data-root scoped, NOT bank scoped -- the same
+    /// blob recurring across two different repos' sessions shares one
+    /// stored object. Omit `content` to read raw bytes from stdin (no
+    /// UTF-8 assumption, unlike every other stdin-reading command here --
+    /// a compressed-away tool result can legitimately be non-UTF-8).
+    CcrPut {
+        content: Option<String>,
+        /// Informational only (e.g. squishi's `kind` field) -- never used
+        /// for lookup, which is purely content-hash based.
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Recover the exact original bytes for a handle printed by
+    /// `ccr-put`. Writes raw bytes to stdout -- never adds or strips so
+    /// much as a trailing newline.
+    CcrGet { handle: String },
+    /// Evict CCR entries: first anything older than the age cutoff, then
+    /// -- if the store is still over the byte cap -- oldest-by-last-use
+    /// until under it. Flags override `trm.json`'s `ccr.max_age_days` /
+    /// `ccr.max_bytes`, which override the built-in defaults (3 days,
+    /// 500MB).
+    CcrGc {
+        #[arg(long)]
+        max_age_days: Option<u64>,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+    },
+    /// Report CCR store size: entry count, total bytes, oldest entry age.
+    CcrStats {
         #[arg(long)]
         json: bool,
     },
@@ -340,6 +374,42 @@ up; warnings don't fail the run. `--fix` is the only thing this command
 ever mutates, and only reclaims a lock already confirmed stale (dead
 pid) — never a live one.
 
+## CCR (content-addressed recovery)
+
+    trm ccr-put "<content>" [--kind <label>]
+    <content-source> | trm ccr-put              # stdin, RAW BYTES -- no UTF-8 assumption
+    trm ccr-get <handle>
+    trm ccr-gc [--max-age-days <n>] [--max-bytes <n>]
+    trm ccr-stats [--json]
+
+A short-lived, content-addressed store for the exact original bytes behind
+a lossy compression -- distinct from `retain`/`stage` above, which are
+durable and judgment-gated. `ccr-put` writes bytes and prints a handle
+(`ccr_<16 hex chars>`); `ccr-get <handle>` returns those exact bytes,
+byte-for-byte, on stdout. Identical content put twice returns the same
+handle and is stored only once -- the same repeated blob (an identical
+build-log fragment, say) recurring across two different repos' sessions
+shares one object. **Data-root scoped, not bank scoped** -- no `-p/--bank`
+flag applies here, since the whole point is that recovery doesn't belong
+to any one project's memory.
+
+**The fail-closed contract this exists for:** a caller (e.g. `governator`)
+that compresses a tool result lossily should call `ccr-put` on the
+ORIGINAL bytes before it ever hands back the compressed version, and
+attach the handle. If `ccr-put` itself fails, the caller must fall back to
+returning the original, uncompressed content -- never ship a lossy result
+with no way back. `trm` never enforces this on its own; it's a contract
+callers are responsible for.
+
+`ccr-gc` evicts entries: first anything past `--max-age-days` (or
+`trm.json`'s `ccr.max_age_days`, default 3), then -- if the store is still
+over `--max-bytes` (or `ccr.max_bytes`, default 500MB) -- oldest-by-last-
+use until under the cap. A `ccr-get` on an entry resets its age clock, so
+something actually being recovered outlives something untouched. Nothing
+runs `ccr-gc` on a schedule yet -- `trm doctor` WARNs when the store grows
+past its configured limits, pointing here, but the sweep itself is manual
+today.
+
 ## Ingest a Claude Code session
 
     trm ingest-session <transcript.jsonl> [--archive-after] [--trigger manual|precompact|sessionend]
@@ -389,7 +459,10 @@ summarize/discard detail): `trm ingest-session "$transcript_path"
 never failing the hook itself — a staging failure is logged, never blocks
 compaction. Install globally in `~/.claude/settings.json`'s `hooks.PreCompact`
 (matcher `"manual|auto"`, matching both trigger sources) to cover every
-project, or per-project in that repo's own `.claude/settings.json`.
+project, or per-project in that repo's own `.claude/settings.json`. The
+same firing also runs `trm ccr-gc` opportunistically, throttled to at
+most once per hour via a `.last-ccr-gc` marker file at the data root — the
+one place a real session gets a CCR sweep without a separate cron job.
 
 ## Ingest a persona (build an advisor from YouTube/Wikipedia/git/web)
 
@@ -447,6 +520,28 @@ fn read_content_or_stdin(content: Option<String>) -> Result<String, String> {
     }
     let mut buf = String::new();
     io::Read::read_to_string(&mut io::stdin(), &mut buf)
+        .map_err(|e| format!("failed to read stdin: {e}"))?;
+    Ok(buf)
+}
+
+/// Byte-safe counterpart to `read_content_or_stdin`, for `ccr-put` only.
+/// Every other content-reading command in this file assumes UTF-8 text;
+/// a CCR object is the exact bytes of a real tool result, which can
+/// legitimately be non-UTF-8 (a binary log fragment, e.g.) -- reading it
+/// as `String` would silently corrupt it before it ever reaches storage.
+fn read_bytes_or_stdin(content: Option<String>) -> Result<Vec<u8>, String> {
+    if let Some(content) = content {
+        return Ok(content.into_bytes());
+    }
+    if std::io::IsTerminal::is_terminal(&io::stdin()) {
+        return Err(
+            "no content argument given and stdin is a terminal (not a pipe) — \
+             pass content as an argument or pipe it in, e.g. `cat file | trm ccr-put`"
+                .to_string(),
+        );
+    }
+    let mut buf = Vec::new();
+    io::Read::read_to_end(&mut io::stdin(), &mut buf)
         .map_err(|e| format!("failed to read stdin: {e}"))?;
     Ok(buf)
 }
@@ -645,6 +740,90 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::SUCCESS
             }
+        }
+        Commands::CcrPut { content, kind } => {
+            let bytes = match read_bytes_or_stdin(content) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("trm ccr-put failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match ccr::put(&data_root.join("ccr"), &bytes, kind.as_deref()) {
+                Ok(handle) => {
+                    println!("{handle}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm ccr-put failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::CcrGet { handle } => match ccr::get(&data_root.join("ccr"), &handle) {
+            Ok(bytes) => match io::Write::write_all(&mut io::stdout(), &bytes) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("trm ccr-get failed: could not write to stdout: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(e) => {
+                eprintln!("trm ccr-get failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Commands::CcrGc {
+            max_age_days,
+            max_bytes,
+        } => {
+            let cfg = match config::load(&data_root, &cwd) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("trm ccr-gc failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let max_age = std::time::Duration::from_secs(
+                max_age_days.unwrap_or(cfg.ccr_max_age_days) * 24 * 3600,
+            );
+            let max_bytes = max_bytes.unwrap_or(cfg.ccr_max_bytes);
+            match ccr::gc(&data_root.join("ccr"), max_age, max_bytes) {
+                Ok(report) => {
+                    println!(
+                        "removed {} entries, freed {} bytes",
+                        report.removed, report.bytes_freed
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm ccr-gc failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::CcrStats { json } => {
+            let s = ccr::stats(&data_root.join("ccr"));
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "entry_count": s.entry_count,
+                        "total_bytes": s.total_bytes,
+                        "oldest_last_seen": s.oldest_last_seen,
+                    })
+                );
+            } else {
+                println!(
+                    "entries: {}  total_bytes: {}  oldest_last_seen: {}",
+                    s.entry_count,
+                    s.total_bytes,
+                    s.oldest_last_seen
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "n/a".to_string())
+                );
+            }
+            ExitCode::SUCCESS
         }
         Commands::IngestSessions { all } => {
             if !all {
@@ -1330,6 +1509,16 @@ mod tests {
         assert!(CORE_DOCS.contains("claude-code-precompact-hook.sh"));
         assert!(CORE_DOCS.contains("PreCompact"));
         assert!(CORE_DOCS.contains("last_staged_line"));
+        assert!(CORE_DOCS.contains("ccr-gc"));
+    }
+
+    #[test]
+    fn core_docs_covers_ccr() {
+        assert!(CORE_DOCS.contains("trm ccr-put"));
+        assert!(CORE_DOCS.contains("trm ccr-get"));
+        assert!(CORE_DOCS.contains("trm ccr-gc"));
+        assert!(CORE_DOCS.contains("fail-closed"));
+        assert!(CORE_DOCS.contains("not bank scoped"));
     }
 
     #[test]

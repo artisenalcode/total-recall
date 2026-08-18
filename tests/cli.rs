@@ -731,3 +731,88 @@ fn ingest_session_archive_after_and_since_checkpoint_cannot_combine() {
         "a rejected combination must never touch the source transcript"
     );
 }
+
+/// End-to-end: put via stdin, recover via the printed handle, bytes match
+/// exactly. `ccr-put`/`ccr-get` don't take `-p/--bank` -- the store is
+/// data-root scoped, not bank scoped -- so `run_trm` (no bank flag) is the
+/// right helper here, unlike most other commands in this file.
+#[test]
+fn ccr_put_then_get_round_trips_real_content_through_the_binary() {
+    let data_root = scratch_data_root();
+    let put_output = run_trm_with_stdin(
+        &["ccr-put"],
+        data_root.path(),
+        "a real tool result the compressor would have elided",
+    );
+    assert!(put_output.status.success(), "{:?}", put_output);
+    let handle = String::from_utf8_lossy(&put_output.stdout)
+        .trim()
+        .to_string();
+    assert!(handle.starts_with("ccr_"), "unexpected handle: {handle}");
+
+    let get_output = run_trm(&["ccr-get", &handle], data_root.path());
+    assert!(get_output.status.success(), "{:?}", get_output);
+    assert_eq!(
+        get_output.stdout,
+        b"a real tool result the compressor would have elided".to_vec()
+    );
+}
+
+#[test]
+fn ccr_get_on_unknown_handle_fails_with_a_clear_message_not_a_panic() {
+    let data_root = scratch_data_root();
+    let output = run_trm(&["ccr-get", "ccr_0000000000000000"], data_root.path());
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no object found"),
+        "expected a clear not-found message, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn ccr_stats_reports_zero_on_an_untouched_store() {
+    let data_root = scratch_data_root();
+    let output = run_trm(&["ccr-stats", "--json"], data_root.path());
+    assert!(output.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ccr-stats --json must be valid JSON");
+    assert_eq!(value["entry_count"], 0);
+}
+
+#[test]
+fn ccr_stats_reflects_a_real_put() {
+    let data_root = scratch_data_root();
+    run_trm_with_stdin(&["ccr-put"], data_root.path(), "twelve bytes!");
+
+    let output = run_trm(&["ccr-stats", "--json"], data_root.path());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["entry_count"], 1);
+    assert_eq!(value["total_bytes"], 13);
+}
+
+/// `ccr-gc --max-age-days 0` evicts everything immediately -- the cheapest
+/// real proof that the gc wiring (flag -> config default -> ccr::gc) is
+/// connected end to end through the actual binary, not just in-module.
+#[test]
+fn ccr_gc_with_zero_max_age_evicts_a_just_stored_entry() {
+    let data_root = scratch_data_root();
+    let put_output = run_trm_with_stdin(&["ccr-put"], data_root.path(), "will be evicted");
+    let handle = String::from_utf8_lossy(&put_output.stdout)
+        .trim()
+        .to_string();
+
+    let gc_output = run_trm(&["ccr-gc", "--max-age-days", "0"], data_root.path());
+    assert!(gc_output.status.success(), "{:?}", gc_output);
+    assert!(
+        String::from_utf8_lossy(&gc_output.stdout).contains("removed 1 entries"),
+        "expected 1 removed, got: {}",
+        String::from_utf8_lossy(&gc_output.stdout)
+    );
+
+    let get_output = run_trm(&["ccr-get", &handle], data_root.path());
+    assert!(
+        !get_output.status.success(),
+        "entry should have been evicted"
+    );
+}

@@ -42,10 +42,35 @@ trm pending-show <job-id>
 trm complete-handover <job-id> "<result>"
 trm curator-scan [--threshold 0.8]        # find duplicate-candidate entries
 trm import <source> --bank <bank>         # migrate markdown into a bank
+trm ccr-put "<content>"                   # store bytes for later exact recovery, prints a handle
+trm ccr-get <handle>                      # recover those exact bytes
+trm ccr-gc [--max-age-days N] [--max-bytes N]  # evict old/oversized CCR entries
 ```
 
 Bank resolution precedence: explicit `-p/--bank` flag > `.trm-bank` file
 at the repo root > git remote (owner/repo slug) > path hash > `global`.
+
+## CCR (content-addressed recovery)
+
+A short-lived, content-addressed store for the exact bytes behind a lossy
+compression — distinct from `retain`/`stage` above, which are durable and
+judgment-gated. `ccr-put` writes bytes and prints a handle
+(`ccr_<16 hex chars>`); `ccr-get <handle>` returns those exact bytes,
+byte-for-byte. Identical content put twice returns the same handle and is
+stored once — data-root scoped, not bank scoped, so the same repeated
+blob across two different repos' sessions shares one object.
+
+The intended pattern: a caller (e.g. [`governator`](https://github.com/artisenalcode/governator))
+compresses a tool result lossily, calls `ccr-put` on the ORIGINAL bytes
+first, and attaches the handle. If `ccr-put` itself fails, the caller
+falls back to shipping the uncompressed original rather than a lossy
+result with no way back — `trm` doesn't enforce this, it's a contract
+callers are responsible for. `ccr-gc` evicts entries past a configurable
+age (default 3 days) or once the store exceeds a size cap (default
+500MB); `trm doctor` warns when either limit is exceeded. The PreCompact
+hook below also runs `ccr-gc` opportunistically (throttled to at most
+once per hour via a marker file) whenever it fires, so a real session
+gets a sweep without a separate cron job.
 
 ## Persona ingestion
 

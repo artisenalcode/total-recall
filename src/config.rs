@@ -35,6 +35,14 @@ pub struct TrmConfig {
     pub min_bytes: usize,
     /// `None` == keep archived transcripts forever.
     pub retention_days: Option<u64>,
+    /// `ccr-gc`'s default age cutoff, in days -- an entry whose `last_seen`
+    /// is older than this is evicted. 3 days is generous enough to survive
+    /// a slow-moving multi-day task without accumulating forever.
+    pub ccr_max_age_days: u64,
+    /// `ccr-gc`'s default total-size cap across the whole CCR store, in
+    /// bytes -- bounds unbounded growth even before the age cutoff would
+    /// otherwise kick in on a very active machine.
+    pub ccr_max_bytes: u64,
 }
 
 impl Default for TrmConfig {
@@ -46,6 +54,8 @@ impl Default for TrmConfig {
             min_turns: 1,
             min_bytes: 0,
             retention_days: None,
+            ccr_max_age_days: 3,
+            ccr_max_bytes: 500_000_000,
         }
     }
 }
@@ -115,6 +125,12 @@ fn merge(config: &mut TrmConfig, value: &Value) {
     {
         config.retention_days = Some(n);
     }
+    if let Some(n) = value.pointer("/ccr/max_age_days").and_then(|v| v.as_u64()) {
+        config.ccr_max_age_days = n;
+    }
+    if let Some(n) = value.pointer("/ccr/max_bytes").and_then(|v| v.as_u64()) {
+        config.ccr_max_bytes = n;
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +193,51 @@ mod tests {
         let result = load(tmp.path(), tmp.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("trm.json"));
+    }
+
+    #[test]
+    fn ccr_defaults_apply_when_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = load(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(config.ccr_max_age_days, 3);
+        assert_eq!(config.ccr_max_bytes, 500_000_000);
+    }
+
+    #[test]
+    fn global_file_overrides_ccr_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("trm.json"),
+            r#"{"ccr": {"max_age_days": 14, "max_bytes": 1000}}"#,
+        )
+        .unwrap();
+        let config = load(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(config.ccr_max_age_days, 14);
+        assert_eq!(config.ccr_max_bytes, 1000);
+    }
+
+    #[test]
+    fn project_override_wins_over_global_for_ccr_fields_too() {
+        let data_root = tempfile::tempdir().unwrap();
+        fs::write(
+            data_root.path().join("trm.json"),
+            r#"{"ccr": {"max_age_days": 14}}"#,
+        )
+        .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        fs::create_dir_all(repo.path().join(".trm")).unwrap();
+        fs::write(
+            repo.path().join(".trm").join("trm.json"),
+            r#"{"ccr": {"max_age_days": 1}}"#,
+        )
+        .unwrap();
+
+        let config = load(data_root.path(), repo.path()).unwrap();
+        assert_eq!(config.ccr_max_age_days, 1);
+        // Untouched field keeps the default, not the global file's silence.
+        assert_eq!(config.ccr_max_bytes, 500_000_000);
     }
 
     #[test]

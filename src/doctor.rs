@@ -15,6 +15,8 @@
 //! convention, already applied twice this session).
 
 use crate::bank;
+use crate::ccr;
+use crate::config;
 use crate::embeddings::Embedder;
 use crate::lock;
 use std::path::Path;
@@ -112,6 +114,8 @@ pub fn run(data_root: &Path, cwd: &Path, quick: bool) -> DoctorReport {
     let models_dir = data_root.join("models");
     checks.push(check_model_cache_reachable(&models_dir));
     checks.push(check_embedder_loads(&models_dir, quick));
+
+    checks.push(check_ccr_health(data_root, cwd));
 
     DoctorReport { checks }
 }
@@ -275,6 +279,54 @@ fn check_embedder_loads(models_dir: &Path, quick: bool) -> Check {
     }
 }
 
+/// Reports CCR store size against `trm.json`'s configured limits (or the
+/// built-in defaults if unset/unreadable). WARN, never FAIL -- an
+/// oversized store is a real "you should run `ccr-gc`" nudge, not a broken
+/// tool, same posture as `check_bank_resolution`'s "not created yet" case.
+/// A malformed `trm.json` is not re-surfaced here -- that's already a hard
+/// error on the command paths that actually read it (`ingest-session`,
+/// `ccr-gc`); this check falls back to defaults rather than duplicating
+/// that failure under a misleading name.
+fn check_ccr_health(data_root: &Path, cwd: &Path) -> Check {
+    let name = "ccr_health".to_string();
+    let cfg = config::load(data_root, cwd).unwrap_or_default();
+    let stats = ccr::stats(&data_root.join("ccr"));
+
+    let max_age_secs = cfg.ccr_max_age_days * 24 * 3600;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let oldest_age_secs = stats.oldest_last_seen.map(|t| now.saturating_sub(t));
+
+    let over_bytes = stats.total_bytes > cfg.ccr_max_bytes;
+    let over_age = oldest_age_secs.is_some_and(|age| age > max_age_secs);
+
+    if over_bytes || over_age {
+        Check {
+            name,
+            status: Status::Warn,
+            message: format!(
+                "{} entries, {} bytes (cap {}), oldest entry {}s old (cutoff {}s) — run `trm ccr-gc`",
+                stats.entry_count,
+                stats.total_bytes,
+                cfg.ccr_max_bytes,
+                oldest_age_secs.unwrap_or(0),
+                max_age_secs
+            ),
+        }
+    } else {
+        Check {
+            name,
+            status: Status::Pass,
+            message: format!(
+                "{} entries, {} bytes, within configured limits",
+                stats.entry_count, stats.total_bytes
+            ),
+        }
+    }
+}
+
 /// The one real repair available in today's failure surface: reclaim a
 /// stale (dead-pid) lock. Returns what it did, or `None` if there was
 /// nothing to fix. Strictly opt-in — `run()` above never calls this.
@@ -416,6 +468,61 @@ mod tests {
         let paths = bank::paths_for(tmp.path(), "some-bank");
         std::fs::create_dir_all(&paths.root).unwrap();
         assert!(fix(&paths).is_none());
+    }
+
+    #[test]
+    fn ccr_health_check_passes_on_an_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let check = check_ccr_health(tmp.path(), tmp.path());
+        assert_eq!(check.status, Status::Pass);
+    }
+
+    #[test]
+    fn ccr_health_check_warns_when_over_configured_byte_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path();
+        ccr::put(&data_root.join("ccr"), b"twenty bytes of blob", None).unwrap();
+        std::fs::write(data_root.join("trm.json"), r#"{"ccr": {"max_bytes": 1}}"#).unwrap();
+
+        let check = check_ccr_health(data_root, data_root);
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("ccr-gc"));
+    }
+
+    #[test]
+    fn ccr_health_check_warns_when_oldest_entry_exceeds_the_age_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path();
+        let ccr_root = data_root.join("ccr");
+        let handle = ccr::put(&ccr_root, b"an aging blob", None).unwrap();
+        let meta = ccr::meta_path_for(&ccr_root, &handle).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+        value["last_seen"] = serde_json::json!(0); // unix epoch -- guaranteed ancient
+        std::fs::write(&meta, serde_json::to_string(&value).unwrap()).unwrap();
+        std::fs::write(
+            data_root.join("trm.json"),
+            r#"{"ccr": {"max_age_days": 1}}"#,
+        )
+        .unwrap();
+
+        let check = check_ccr_health(data_root, data_root);
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("ccr-gc"));
+    }
+
+    #[test]
+    fn ccr_health_check_falls_back_to_defaults_on_malformed_config_instead_of_erroring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path();
+        std::fs::write(data_root.join("trm.json"), "{not valid json").unwrap();
+
+        // Must not panic and must report the (empty) real store state under
+        // the default thresholds, not surface the config parse error here.
+        let check = check_ccr_health(data_root, data_root);
+        assert_eq!(check.status, Status::Pass);
     }
 
     #[test]
