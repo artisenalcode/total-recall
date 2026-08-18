@@ -95,4 +95,6 @@ cargo fmt --check
 ```
 
 CI caches the embedding model (`~/.trm/models`, all-MiniLM-L6-v2 via
-ONNX/fastembed) so it isn't re-downloaded every run.
+`candle` — see `src/embeddings.rs`'s module doc comment for the
+2026-08-18 port off `fastembed`/`ort`) so it isn't re-downloaded every
+run.

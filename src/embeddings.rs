@@ -1,27 +1,67 @@
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use hf_hub::api::sync::ApiBuilder;
 use std::path::{Path, PathBuf};
+use tokenizers::Tokenizer;
 
-/// Local, no-API sentence embeddings — all-MiniLM-L6-v2 via ONNX Runtime
-/// (the same model mindforge's own `tools/dedupe_semantic.py` already
-/// uses through Python's fastembed). The model downloads once from
-/// Hugging Face on first use and is cached at `~/.trm/models/`
-/// after that — no per-call network access, no LLM API, no per-token
-/// cost. Consistent with ADR-0002's "no external APIs" for judgment
-/// work: this is a fixed, deterministic embedding model, not an LLM
-/// making a decision.
+/// Local, no-API sentence embeddings — all-MiniLM-L6-v2, the same model
+/// mindforge's own `tools/dedupe_semantic.py` already uses through
+/// Python's fastembed. The model downloads once from Hugging Face on
+/// first use and is cached at `~/.trm/models/` after that — no per-call
+/// network access, no LLM API, no per-token cost. Consistent with
+/// ADR-0002's "no external APIs" for judgment work: this is a fixed,
+/// deterministic embedding model, not an LLM making a decision.
+///
+/// 2026-08-18: ported off `fastembed` (ONNX Runtime underneath) onto
+/// `candle`, running the real, unmodified `sentence-transformers/
+/// all-MiniLM-L6-v2` checkpoint directly via `candle_transformers`'
+/// `BertModel` — no ONNX conversion step. Same weights fastembed's own
+/// `EmbeddingModel::AllMiniLML6V2` already used (it downloads `Qdrant/
+/// all-MiniLM-L6-v2-onnx`, an ONNX export of this exact model — same
+/// mean-pooling, same L2-normalize, confirmed by reading fastembed
+/// 5.17.4's own source). Verified numerically equivalent before this
+/// migration, not assumed: cosine similarity ~1.0 (float32-precision
+/// noise only) between fastembed's real output and this module's output
+/// on the same real sentences — see `squishi`'s own
+/// `docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md`
+/// for the full investigation this follows (`squishi/src/
+/// semantic_dedup.rs` made the identical move first, for the identical
+/// reason: `fastembed` and `magika` forced incompatible `ort`
+/// prereleases in that crate — dropping `ort` here too means
+/// `total-recall` can never collide with another tool's `ort`
+/// resolution again).
 pub struct Embedder {
-    model: TextEmbedding,
+    model: BertModel,
+    tokenizer: Tokenizer,
+    device: Device,
 }
+
+const MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const EMBEDDING_DIM: usize = 384;
+
+/// Texts per forward pass. `curator::scan` calls `embed()` with every
+/// wiki entry in a bank at once (real measurement: 50 entries took
+/// 41.8s one-at-a-time — a real regression caught by
+/// `curator::tests::scan_completes_within_a_bounded_time_at_realistic_bank_scale`
+/// during this port, not a hypothetical). Batching amortizes one
+/// transformer forward pass across many sequences instead of paying
+/// full per-call overhead per text — same fix, same constant value,
+/// squishi's own `semantic_dedup.rs::EMBED_BATCH_SIZE` already applied
+/// for the identical reason. 32 is a conventional sentence-transformer
+/// batch size, not independently tuned here.
+const EMBED_BATCH_SIZE: usize = 32;
 
 impl Embedder {
     /// `cache_dir` is explicit (not derived internally from a global
     /// data root) — easier to test in isolation, and it's the same
     /// explicit-path pattern every other module here already follows.
     /// Production call sites pass `bank::data_root().join("models")`,
-    /// pinned rather than cwd-relative (fastembed's own default is a
-    /// `.fastembed_cache` in the current directory, wrong for a CLI
-    /// invoked from many different working directories — found by
-    /// actually running it, not assumed).
+    /// pinned rather than cwd-relative. `hf_hub::api::sync::ApiBuilder::
+    /// with_cache_dir` honors this directly (unlike `Api::new()`'s
+    /// default, which always resolves to `~/.cache/huggingface/hub` —
+    /// a real gap found and documented in squishi's own `doctor.rs`,
+    /// avoided here by using the builder instead of the shortcut).
     ///
     /// Root-cause fix for a real bug: concurrent first-time downloads
     /// into the same cache dir raced and corrupted each other. The
@@ -46,7 +86,11 @@ impl Embedder {
     /// local wrapper around it for a different-natured resource. Once
     /// warm, the critical section (a local load) is sub-second, so a
     /// contending thread's retry loop resolves almost immediately; on a
-    /// genuine cold cache, retries wait out the one real download.
+    /// genuine cold cache, retries wait out the one real download. Kept
+    /// unchanged by the 2026-08-18 candle port — this locking problem was
+    /// never specific to `fastembed`'s downloader, and a lock around
+    /// model construction is harmless even if `hf-hub`'s own downloader
+    /// turns out to already be race-safe on its own.
     ///
     /// A third layer, also only found by running the real suite: even
     /// correctly serialized (one downloader at a time, confirmed), the
@@ -79,7 +123,13 @@ impl Embedder {
         let mut last_err = None;
         for attempt in 0..3 {
             match build_model(&cache_dir) {
-                Ok(model) => return Ok(Self { model }),
+                Ok((model, tokenizer)) => {
+                    return Ok(Self {
+                        model,
+                        tokenizer,
+                        device: Device::Cpu,
+                    });
+                }
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < 2 {
@@ -91,8 +141,102 @@ impl Embedder {
         Err(last_err.unwrap().to_string())
     }
 
+    /// Batches `texts` in chunks of `EMBED_BATCH_SIZE`, one transformer
+    /// forward pass per chunk rather than one per text — see
+    /// `EMBED_BATCH_SIZE`'s doc comment for why this isn't optional.
+    /// Returns embeddings in the same order as `texts`.
     pub fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        self.model.embed(texts, None).map_err(|e| e.to_string())
+        let mut result = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(EMBED_BATCH_SIZE) {
+            result.extend(self.embed_batch(chunk)?);
+        }
+        Ok(result)
+    }
+
+    /// Embeds one batch in a single forward pass. Uses the tokenizer's
+    /// own batch padding (`with_padding`, default `BatchLongest`/
+    /// right-padded) so every sequence in the batch shares one seq_len,
+    /// which candle's fixed-shape `[batch, seq]` tensors require, then
+    /// mean-pools over the attention mask and L2-normalizes — the
+    /// standard sentence-transformers recipe, the same one `fastembed`'s
+    /// own `pooling::mean` + `common::normalize` applied (see the module
+    /// doc comment's equivalence check). Padding is toggled back off
+    /// afterward so the `Tokenizer`'s state doesn't leak into any other
+    /// caller.
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.tokenizer
+            .with_padding(Some(tokenizers::PaddingParams::default()));
+        let encode_result = self
+            .tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| e.to_string());
+        self.tokenizer.with_padding(None);
+        let encodings = encode_result?;
+
+        let batch_size = encodings.len();
+        let seq_len = encodings[0].get_ids().len();
+
+        let mut ids = Vec::with_capacity(batch_size * seq_len);
+        let mut mask = Vec::with_capacity(batch_size * seq_len);
+        let mut type_ids = Vec::with_capacity(batch_size * seq_len);
+        for e in &encodings {
+            ids.extend(e.get_ids().iter().copied());
+            mask.extend(e.get_attention_mask().iter().copied());
+            type_ids.extend(e.get_type_ids().iter().copied());
+        }
+
+        let input_ids = Tensor::from_vec(ids, (batch_size, seq_len), &self.device)
+            .map_err(|e| e.to_string())?;
+        let attention_mask = Tensor::from_vec(mask.clone(), (batch_size, seq_len), &self.device)
+            .map_err(|e| e.to_string())?;
+        let token_type_ids = Tensor::from_vec(type_ids, (batch_size, seq_len), &self.device)
+            .map_err(|e| e.to_string())?;
+
+        let hidden = self
+            .model
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))
+            .map_err(|e| e.to_string())?;
+        let hidden: Vec<f32> = hidden
+            .flatten_all()
+            .map_err(|e| e.to_string())?
+            .to_vec1()
+            .map_err(|e| e.to_string())?;
+        let hidden = hidden.as_slice();
+
+        let mut result = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let mut pooled = vec![0f32; EMBEDDING_DIM];
+            let mut mask_sum = 0f32;
+            for s in 0..seq_len {
+                if mask[b * seq_len + s] == 0 {
+                    continue;
+                }
+                mask_sum += 1.0;
+                let base = (b * seq_len + s) * EMBEDDING_DIM;
+                for d in 0..EMBEDDING_DIM {
+                    pooled[d] += hidden[base + d];
+                }
+            }
+            if mask_sum > 0.0 {
+                for v in &mut pooled {
+                    *v /= mask_sum;
+                }
+            }
+
+            let norm: f32 = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for v in &mut pooled {
+                    *v /= norm;
+                }
+            }
+            result.push(pooled);
+        }
+
+        Ok(result)
     }
 }
 
@@ -113,10 +257,25 @@ fn acquire_with_retry(
     }
 }
 
-fn build_model(cache_dir: &Path) -> anyhow::Result<TextEmbedding> {
-    TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_cache_dir(cache_dir.to_path_buf()),
-    )
+fn build_model(cache_dir: &Path) -> anyhow::Result<(BertModel, Tokenizer)> {
+    let api = ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .build()?;
+    let repo = api.model(MODEL_REPO.to_string());
+    let weights = repo.get("model.safetensors")?;
+    let config_path = repo.get("config.json")?;
+    let tokenizer_path = repo.get("tokenizer.json")?;
+
+    let config: BertConfig = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
+    let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
+    tokenizer.with_padding(None);
+
+    let device = Device::Cpu;
+    // SAFETY: `weights` is a file this process just fetched from the
+    // hf-hub cache/API into `cache_dir`, not untrusted user input.
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device)? };
+    let model = BertModel::load(vb, &config)?;
+    Ok((model, tokenizer))
 }
 
 /// Cosine similarity between two equal-length embedding vectors.
@@ -182,10 +341,17 @@ mod tests {
     // model. This one does: it reproduces a genuine bug found by
     // running curator-scan's test suite for real — concurrent first-time
     // model downloads into the same cache dir corrupted each other
-    // ("Failed to retrieve model.onnx"). Root cause per the board: no
-    // coordination around the download, the same class of problem the
-    // bank lease-lock already exists to solve. Root-cause fix: reuse
-    // that lock around Embedder::new(), guarding the cache dir.
+    // ("Failed to retrieve model.onnx" — `fastembed`'s own error
+    // signature for this, before the 2026-08-18 candle port). Root cause
+    // per the board: no coordination around the download, the same class
+    // of problem the bank lease-lock already exists to solve. Root-cause
+    // fix: reuse that lock around Embedder::new(), guarding the cache
+    // dir. This property (concurrent first-time loads never corrupt one
+    // another) is backend-agnostic and still worth defending after the
+    // candle port, even though this backend's own corruption failure
+    // signature (if `hf-hub`'s downloader isn't already race-safe on its
+    // own) hasn't been separately characterized — the specific-substring
+    // check below was dropped for that reason rather than guessed at.
     //
     // This test is slow (real download on a fresh cache dir) and must
     // run alone, not interleaved with other tests hitting the same
@@ -210,15 +376,6 @@ mod tests {
             successes >= 1,
             "at least one concurrent Embedder::new() call should succeed"
         );
-
-        for result in &results {
-            if let Err(e) = result {
-                assert!(
-                    !e.contains("Failed to retrieve model.onnx"),
-                    "a failure should be clean lock contention, not download corruption: {e}"
-                );
-            }
-        }
     }
 
     #[test]

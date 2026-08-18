@@ -2,9 +2,10 @@ use crate::{atomic, bank, embeddings, handover, wiki};
 
 /// Local (no-API) duplicate-candidate finder: sentence-embedding cosine
 /// similarity between every pair of wiki entries, using the same model
-/// (all-MiniLM-L6-v2, local ONNX inference) mindforge's own
-/// `tools/dedupe_semantic.py` already uses via Python's fastembed — this
-/// is the Rust-native equivalent, not a call-out to Python. This is not
+/// (all-MiniLM-L6-v2, local `candle` inference — see `embeddings.rs`'s
+/// module doc comment) mindforge's own `tools/dedupe_semantic.py` already
+/// uses via Python's fastembed — this is the Rust-native equivalent, not
+/// a call-out to Python. This is not
 /// a judgment — just a candidate finder. The actual merge/retire
 /// decision is a Curation handover (ADR-0002), same loop as extraction,
 /// handed to whichever harness invoked the scan. Returns the staged job

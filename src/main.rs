@@ -371,10 +371,10 @@ for audit, it isn't deleted.
 
     trm curator-scan [--threshold 0.8]
 
-Local sentence-embedding cosine similarity (all-MiniLM-L6-v2 via ONNX,
-downloaded once and cached at `~/.trm/models/`, no external API —
-the same model mindforge's own `tools/dedupe_semantic.py` already uses
-through Python's fastembed, this is the Rust-native equivalent) between
+Local sentence-embedding cosine similarity (all-MiniLM-L6-v2 via
+`candle`, downloaded once and cached at `~/.trm/models/`, no external
+API — the same model mindforge's own `tools/dedupe_semantic.py` already
+uses through Python's fastembed, this is the Rust-native equivalent) between
 every pair of wiki entries — a candidate finder, not a judgment. Stages a
 Curation handover per pair above threshold, same completion flow as
 extraction. An exact/fully-contained-content pre-check runs first and is

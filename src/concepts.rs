@@ -2,11 +2,13 @@
 //! near-duplicate paraphrases — the algorithm `advisory/tools/
 //! dedupe_semantic.py` already proved out (sentence-level split, greedy
 //! cosine clustering, threshold 0.8). `squishi/src/semantic_dedup.rs`
-//! already ported this once in raw `ort` (needed there — `fastembed`
-//! conflicts with `magika`'s `ort` pin in that crate). No such conflict
-//! here: `total-recall` already has `fastembed` wired via
-//! `embeddings::Embedder`, so this reuses it directly rather than adding
-//! a second embedding stack.
+//! already ported this once, on `candle` (see that crate's own
+//! `docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md`).
+//! `total-recall` already has `candle` wired via `embeddings::Embedder`
+//! for the identical reason (it used to depend on `fastembed`, which
+//! forced an `ort` version incompatible with `magika`'s pin in squishi —
+//! both crates are off `ort` entirely now), so this reuses it directly
+//! rather than adding a second embedding stack.
 //!
 //! Per ADR-0004: this is what turns a bulk/ambiguous `stage()` payload
 //! into indexed candidate concepts for a handover's sub-agent to judge

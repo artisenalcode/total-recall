@@ -11,11 +11,23 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 clap = { version = "4.6.5", features = ["derive"] }
 flate2 = "1.0"
-fastembed = { version = "5.17.4", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls", "image-models"] }
 serde_json = "1"
 sha2 = "0.10"
 ureq = "3.3.0"
 clap_mangen = "0.3.3"
+# 2026-08-18: embeddings.rs ported off fastembed (ort underneath) onto
+# candle, running the real sentence-transformers/all-MiniLM-L6-v2
+# checkpoint directly -- same move squishi made for the identical reason
+# (fastembed and magika forced incompatible ort prereleases across the
+# two crates). See src/embeddings.rs's module doc comment and
+# squishi/docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md.
+# No candle-onnx here (unlike squishi) -- this crate never touches ONNX
+# directly, so plain crates.io 0.11.0 is used unpatched.
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+hf-hub = { version = "=0.5.0", default-features = false, features = ["rustls-tls", "ureq"] }
+tokenizers = "=0.22.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
