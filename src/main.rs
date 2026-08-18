@@ -15,7 +15,7 @@ mod session_checkpoint;
 mod wiki;
 mod window;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -41,13 +41,22 @@ enum Commands {
     /// Omit `content` to read from stdin instead — no shell-argument size
     /// limit, no quoting/escaping fragility for large content (unlike a
     /// positional argument, which Linux caps around 128KB per element).
-    Retain { content: Option<String> },
+    Retain {
+        /// The fact to store. Omit to read from stdin instead.
+        content: Option<String>,
+    },
     /// Case-insensitive substring search across the resolved bank's wiki tier.
-    Recall { query: String },
+    Recall {
+        /// Substring to search for.
+        query: String,
+    },
     /// Stage raw content for a sub-agent handover (extraction), per ADR-0002.
     /// Omit `content` to read from stdin instead — same reasoning as `retain`.
     Stage {
+        /// The content to stage. Omit to read from stdin instead.
         content: Option<String>,
+        /// Why this is being staged -- shown to the sub-agent completing
+        /// the handover.
         #[arg(long)]
         reason: String,
         /// Provenance label. "direct" (default) is trusted; anything else
@@ -67,21 +76,28 @@ enum Commands {
     /// no cwd-based resolution, since an external caller has no
     /// meaningful cwd relationship to a bank.
     StagePersona {
+        /// Path to the payload manifest JSON file.
         #[arg(long)]
         manifest: PathBuf,
     },
     /// List open handover jobs in the resolved bank, or every bank with --all.
     Pending {
+        /// List every bank's pending jobs instead of just the resolved one.
         #[arg(long)]
         all: bool,
     },
     /// Print a pending job's exact rendered prompt — feed this verbatim to
     /// a sub-agent to complete the handover.
-    PendingShow { job_id: String },
+    PendingShow {
+        /// Job id from `pending`'s output.
+        job_id: String,
+    },
     /// Scan the resolved bank for duplicate-candidate wiki entries
     /// (word-overlap heuristic, no LLM) and stage Curation handovers
     /// for any pair above the threshold.
     CuratorScan {
+        /// Word-overlap similarity above which a pair is flagged as a
+        /// duplicate candidate (0.0-1.0).
         #[arg(long, default_value_t = 0.8)]
         threshold: f64,
     },
@@ -91,7 +107,10 @@ enum Commands {
     /// `retain`/`stage`: a synthesized persona wiki page can run to tens
     /// of KB, well past comfortable argv territory.
     CompleteHandover {
+        /// Job id from `pending`'s output.
         job_id: String,
+        /// The completed handover's result. Omit to read from stdin
+        /// instead — a synthesized wiki page can run to tens of KB.
         result: Option<String>,
     },
     /// Serve live usage docs, so the skill stub never goes stale.
@@ -104,7 +123,9 @@ enum Commands {
     /// (minus a `MEMORY.md` index file, which is skipped — it's an
     /// index, not a fact).
     Import {
+        /// Directory to recursively import every `*.md` file from.
         source: PathBuf,
+        /// Bank to import into.
         #[arg(long)]
         bank: String,
     },
@@ -120,6 +141,7 @@ enum Commands {
         /// mutation this command ever makes, and only with this flag.
         #[arg(long)]
         fix: bool,
+        /// Emit machine-readable JSON instead of the plain-text report.
         #[arg(long)]
         json: bool,
     },
@@ -130,6 +152,8 @@ enum Commands {
     /// UTF-8 assumption, unlike every other stdin-reading command here --
     /// a compressed-away tool result can legitimately be non-UTF-8).
     CcrPut {
+        /// Bytes to store. Omit to read raw bytes from stdin instead (no
+        /// UTF-8 assumption).
         content: Option<String>,
         /// Informational only (e.g. squishi's `kind` field) -- never used
         /// for lookup, which is purely content-hash based.
@@ -139,20 +163,26 @@ enum Commands {
     /// Recover the exact original bytes for a handle printed by
     /// `ccr-put`. Writes raw bytes to stdout -- never adds or strips so
     /// much as a trailing newline.
-    CcrGet { handle: String },
+    CcrGet {
+        /// Handle printed by `ccr-put` (`ccr_<16 hex chars>`).
+        handle: String,
+    },
     /// Evict CCR entries: first anything older than the age cutoff, then
     /// -- if the store is still over the byte cap -- oldest-by-last-use
     /// until under it. Flags override `trm.json`'s `ccr.max_age_days` /
     /// `ccr.max_bytes`, which override the built-in defaults (3 days,
     /// 500MB).
     CcrGc {
+        /// Override `trm.json`'s `ccr.max_age_days` (built-in default: 3).
         #[arg(long)]
         max_age_days: Option<u64>,
+        /// Override `trm.json`'s `ccr.max_bytes` (built-in default: 500MB).
         #[arg(long)]
         max_bytes: Option<u64>,
     },
     /// Report CCR store size: entry count, total bytes, oldest entry age.
     CcrStats {
+        /// Emit machine-readable JSON instead of the plain-text report.
         #[arg(long)]
         json: bool,
     },
@@ -181,6 +211,7 @@ enum Commands {
     /// the cwd `trm` itself is invoked from -- `-p/--bank` still
     /// overrides both if given explicitly.
     IngestSession {
+        /// Path to the Claude Code session transcript (JSONL).
         path: PathBuf,
         /// After staging succeeds, gzip-archive the transcript into the
         /// resolved bank's `sessions/` tier and remove the original from
@@ -212,6 +243,15 @@ enum Commands {
         #[arg(long, value_enum, default_value = "manual")]
         trigger: Trigger,
     },
+    /// Write real roff(7) man pages (one per subcommand) to this
+    /// directory. Regenerated from this exact `Commands` definition via
+    /// `clap_mangen` — every subcommand's doc comment above becomes its
+    /// man page's DESCRIPTION, so the two can never drift.
+    #[command(hide = true)]
+    GenerateMan {
+        /// Directory to write trm.1, trm-retain.1, etc.
+        out_dir: PathBuf,
+    },
 }
 
 /// Which caller is invoking `ingest-session` (ADR-0006 Phase 1). `manual`
@@ -227,6 +267,7 @@ enum Trigger {
 
 #[derive(Subcommand)]
 enum SkillAction {
+    /// Print live usage docs for `topic` (currently only `core` is wired).
     Get { topic: String },
 }
 
@@ -552,6 +593,22 @@ fn main() -> ExitCode {
     let data_root = bank::data_root();
 
     match cli.command {
+        Commands::GenerateMan { out_dir } => {
+            if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                eprintln!("trm generate-man: failed to create {out_dir:?}: {e}");
+                return ExitCode::FAILURE;
+            }
+            match clap_mangen::generate_to(Cli::command(), &out_dir) {
+                Ok(()) => {
+                    println!("wrote man pages to {}", out_dir.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("trm generate-man: failed to write man pages: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Commands::Retain { content } => {
             let content = match read_content_or_stdin(content) {
                 Ok(content) => content,

@@ -816,3 +816,35 @@ fn ccr_gc_with_zero_max_age_evicts_a_just_stored_entry() {
         "entry should have been evicted"
     );
 }
+
+#[test]
+fn generate_man_writes_one_real_man_page_per_subcommand() {
+    let data_root = scratch_data_root();
+    let man_dir = tempfile::tempdir().unwrap();
+
+    let output = run_trm(
+        &["generate-man", man_dir.path().to_str().unwrap()],
+        data_root.path(),
+    );
+    assert!(output.status.success(), "{:?}", output);
+
+    let top = std::fs::read_to_string(man_dir.path().join("trm.1")).unwrap();
+    assert!(top.contains(".TH trm"), "missing .TH header: {top}");
+    assert!(
+        top.contains("trm\\-retain(1)"),
+        "top-level page should cross-reference subcommand pages: {top}"
+    );
+
+    let ccr_gc = std::fs::read_to_string(man_dir.path().join("trm-ccr-gc.1")).unwrap();
+    assert!(
+        ccr_gc.contains("Override"),
+        "missing a real documented flag: {ccr_gc}"
+    );
+
+    // generate-man itself is a hidden dev-only subcommand -- must not
+    // appear in the user-facing man page it produces.
+    assert!(
+        !top.contains("generate\\-man"),
+        "hidden subcommand leaked into its own output"
+    );
+}
