@@ -59,9 +59,14 @@ jobs:
           key: ${{ runner.os }}-squishi-bin-${{ steps.squishi-sha.outputs.sha }}
       # squishi depends on candle-onnx, whose build script shells out to
       # `protoc` -- not present on the stock ubuntu-latest runner image.
+      # A plain `apt-get update`/`install` hung indefinitely on 2026-08-19
+      # (40+ min, cancelled) -- ubuntu-latest runners can have
+      # unattended-upgrades holding the dpkg lock right after boot, and
+      # apt just blocks on it. `arduino/setup-protoc` downloads the
+      # prebuilt binary directly, no apt/dpkg involved.
       - name: Install protoc
         if: ${{ env.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
       - name: Build and install squishi
         if: ${{ env.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
         # --force: a squishi-bin-cache MISS (this step's own gate) doesn't
