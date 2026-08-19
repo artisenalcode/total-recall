@@ -23,6 +23,10 @@ pub struct BankPaths {
     /// `archived` flag per session id — no line-offset tracking yet,
     /// that's Phase 2's live-compaction concern).
     pub session_state: PathBuf,
+    /// AST-derived code graph for this bank (`graph.json` + a per-file
+    /// content-hash manifest for incremental `trm graph update`) — see
+    /// `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`.
+    pub graph: PathBuf,
 }
 
 /// The data root for all banks. `MF_DATA_ROOT` overrides for tests /
@@ -44,6 +48,7 @@ pub fn paths_for(data_root: &Path, bank_id: &str) -> BankPaths {
         pending: root.join("pending"),
         sessions: root.join("sessions"),
         session_state: root.join(".session-state.json"),
+        graph: root.join("graph"),
         root,
     }
 }
@@ -298,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn paths_for_derives_the_six_bank_subpaths() {
+    fn paths_for_derives_the_seven_bank_subpaths() {
         let data_root = Path::new("/tmp/example-root");
         let paths = paths_for(data_root, "global");
         assert_eq!(paths.root, data_root.join("banks/global"));
@@ -311,6 +316,7 @@ mod tests {
             paths.session_state,
             data_root.join("banks/global/.session-state.json")
         );
+        assert_eq!(paths.graph, data_root.join("banks/global/graph"));
     }
 
     #[test]

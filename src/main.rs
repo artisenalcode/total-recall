@@ -8,6 +8,7 @@ mod curator;
 mod doctor;
 mod embed_cache;
 mod embeddings;
+mod graph;
 mod handover;
 mod ingest;
 mod lock;
@@ -117,6 +118,12 @@ enum Commands {
     Skill {
         #[command(subcommand)]
         action: SkillAction,
+    },
+    /// No-LLM, AST-derived code graph (Rust only, for now) — see
+    /// `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`.
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
     },
     /// One-off migration: recursively import every *.md file under
     /// `source` into a bank, preserving relative filenames as slugs
@@ -269,6 +276,23 @@ enum Trigger {
 enum SkillAction {
     /// Print live usage docs for `topic` (currently only `core` is wired).
     Get { topic: String },
+}
+
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Extract a fresh graph from `path` and save it to the resolved
+    /// bank's `graph` tier, replacing any graph already there.
+    Build { path: PathBuf },
+    /// Print the top `n` nodes by total degree (in + out edges) — the
+    /// nodes with the most fan-in/fan-out, a cheap refactor-risk signal.
+    GodNodes {
+        #[arg(long, default_value_t = 10)]
+        n: usize,
+    },
+    /// Shortest directed path between two node ids (as printed by
+    /// `god-nodes`, or `<relative-path>::<Name>` / `<relative-path>::
+    /// <Type>::<method>` for a guessed id).
+    Path { from: String, to: String },
 }
 
 /// Live usage docs served by `trm skill get core` — the skill stub in
@@ -973,6 +997,70 @@ fn main() -> ExitCode {
                 }
             },
         },
+        Commands::Graph { action } => {
+            let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
+            let paths = bank::paths_for(&data_root, &bank_id);
+            let graph_path = graph::graph_file_path(&paths);
+            match action {
+                GraphAction::Build { path } => match graph::extract::extract_dir(&path) {
+                    Ok(g) => match g.save(&graph_path) {
+                        Ok(()) => {
+                            println!(
+                                "trm graph build: {} nodes, {} edges -> {}",
+                                g.node_count(),
+                                g.edge_count(),
+                                graph_path.display()
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("trm graph build: failed to save graph: {e}");
+                            ExitCode::FAILURE
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("trm graph build: extraction failed: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                GraphAction::GodNodes { n } => match graph::model::CodeGraph::load(&graph_path) {
+                    Ok(g) => {
+                        if g.node_count() == 0 {
+                            eprintln!(
+                                "trm graph god-nodes: no graph yet for this bank -- run `trm graph build <path>` first"
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                        for (id, degree) in graph::god_nodes(&g, n) {
+                            println!("{degree}\t{id}");
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("trm graph god-nodes: failed to load graph: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                GraphAction::Path { from, to } => {
+                    match graph::model::CodeGraph::load(&graph_path) {
+                        Ok(g) => match graph::shortest_path(&g, &from, &to) {
+                            Some(path) => {
+                                println!("{}", path.join(" -> "));
+                                ExitCode::SUCCESS
+                            }
+                            None => {
+                                println!("no path from {from} to {to}");
+                                ExitCode::FAILURE
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("trm graph path: failed to load graph: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
