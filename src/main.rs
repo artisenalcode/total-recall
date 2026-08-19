@@ -119,7 +119,8 @@ enum Commands {
         #[command(subcommand)]
         action: SkillAction,
     },
-    /// No-LLM, AST-derived code graph (Rust only, for now) — see
+    /// No-LLM, AST-derived code graph (Rust, TypeScript/TSX,
+    /// JavaScript, Go, Python) — see
     /// `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`.
     Graph {
         #[command(subcommand)]
@@ -558,7 +559,7 @@ the job. Mechanical only — trm never calls an LLM itself, per ADR-0002;
 synthesis happens when a sub-agent reads the pending prompt and writes
 the actual wiki page via `trm complete-handover`.
 
-## Code graph (Rust only, for now)
+## Code graph (Rust, TypeScript/TSX, JavaScript, Go, Python)
 
     trm graph build <path>              # full extraction, replaces any existing graph
     trm graph update <path>             # re-extract only changed/new files, drop deleted ones

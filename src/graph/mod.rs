@@ -1,4 +1,5 @@
-//! No-LLM, AST-derived code graph for Rust sources
+//! No-LLM, AST-derived code graph for Rust, TypeScript/TSX, JavaScript,
+//! Go, and Python sources
 //! (`docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`).
 //! `model` holds the graph type and its `graph.json` (de)serialization;
 //! `extract` builds one from a directory via tree-sitter. Query verbs
