@@ -2,6 +2,7 @@
 name = "total-recall"
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
 
 [[bin]]
 name = "trm"
