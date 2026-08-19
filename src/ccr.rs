@@ -1,31 +1,6 @@
-//! CCR (content-addressed recovery): a short-lived, bank-agnostic store for
-//! the original bytes behind a lossy compression. Distinct from
-//! `handover.rs`'s stage/pending/complete pipeline (durable, judgment-gated,
-//! bank-scoped) -- this is ephemeral, no judgment involved, and deliberately
-//! NOT bank-scoped: the same repeated blob (an identical build-log fragment
-//! recurring across two different repos' sessions) should share one stored
-//! object, so this lives at the data-root level (`~/.trm/ccr/`), a sibling
-//! of `banks/` and `models/`, not inside any one bank.
-//!
-//! No SQLite -- this crate's whole premise is plain files (see `bank.rs`,
-//! `handover.rs`). An object's identity is its SHA-256 hash (first 16 hex
-//! chars, handle `ccr_<hash16>`), sharded two levels deep like a git object
-//! store (`objects/<aa>/<bb>/<hash16>.bin`) so ten thousand entries never sit
-//! in one flat directory. A small JSON sidecar (`<hash16>.meta.json`) carries
-//! `created_at`/`last_seen`/`size`/`kind` -- `last_seen` is what `gc` sweeps
-//! on, and `get` touches it, so a recently-recovered entry outlives an
-//! untouched one under the same age cutoff.
-//!
-//! Content-addressing gives free dedup: writing the same bytes twice is a
-//! no-op past the first write (same hash -> same file), it just bumps
-//! `last_seen`. `put` verifies its own write by reading the file back before
-//! returning success -- same discipline as `archive.rs`'s
-//! verify-before-delete, applied here as verify-before-trust.
-//!
-//! `put`/`get` need no lock: writes are idempotent (same hash, same bytes,
-//! collision-free in practice) and a completed object file is never mutated
-//! in place, only ever created once or deleted by `gc`. `gc` is the one
-//! operation that deletes, so it's the one that takes the lease lock.
+//! CCR (content-addressed recovery): a short-lived, bank-agnostic store for the original bytes behind a lossy compression, at `~/.trm/ccr/`.
+//! Object identity is its SHA-256 hash (`ccr_<hash16>`), sharded two levels deep with a JSON sidecar tracking `last_seen` for `gc`'s age cutoff.
+//! Content-addressing gives free dedup. `put`/`get` need no lock (idempotent/read-only against a never-mutated file); `gc` deletes, so it locks.
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -38,11 +13,9 @@ const HASH_HEX_LEN: usize = 16;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CcrError {
-    /// The handle isn't shaped like one this store ever issues -- rejected
-    /// before any filesystem access, distinct from a real miss.
+    /// Rejected before any filesystem access, distinct from a real miss.
     MalformedHandle(String),
-    /// The handle is well-formed but no live object exists for it (never
-    /// stored, or evicted by `gc`).
+    /// Well-formed handle, but no live object exists for it.
     NotFound,
     Io(String),
 }
@@ -74,9 +47,7 @@ impl From<serde_json::Error> for CcrError {
     }
 }
 
-/// Compute the handle for `bytes` without touching the filesystem -- used by
-/// `put` to know where to write, and available to any caller that just wants
-/// to check what handle a blob would get.
+/// Compute the handle for `bytes` without touching the filesystem.
 pub fn handle_for(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -107,12 +78,7 @@ fn object_path(ccr_root: &Path, hash: &str) -> PathBuf {
         .join(format!("{hash}.bin"))
 }
 
-/// `meta_path`, but takes a full handle (and validates it) rather than a
-/// bare hash -- exposed crate-internally so other modules' tests can reach
-/// a stored entry's sidecar directly (e.g. `doctor`'s CCR health-check
-/// tests, which need to backdate `last_seen` without real time passing).
-/// `cfg(test)`-only: nothing outside a test build has a legitimate reason
-/// to touch a sidecar file directly.
+/// `meta_path`, but takes and validates a full handle -- lets other modules' tests backdate `last_seen` directly.
 #[cfg(test)]
 pub(crate) fn meta_path_for(ccr_root: &Path, handle: &str) -> Option<PathBuf> {
     parse_handle(handle)
@@ -135,11 +101,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Store `bytes`, returning its handle. Idempotent: identical content
-/// written twice touches only the sidecar's `last_seen` the second time --
-/// no second copy on disk. Verifies its own write (reads the file back and
-/// compares against `bytes`) before returning success, so a caller that
-/// gets a handle back can trust it round-trips.
+/// Store `bytes`, returning its handle. Idempotent, and verifies its own write before returning success.
 pub fn put(ccr_root: &Path, bytes: &[u8], kind: Option<&str>) -> Result<String, CcrError> {
     let handle = handle_for(bytes);
     let hash = parse_handle(&handle).expect("handle_for always produces a well-formed handle");
@@ -153,13 +115,9 @@ pub fn put(ccr_root: &Path, bytes: &[u8], kind: Option<&str>) -> Result<String, 
 
     crate::atomic::write_bytes(&obj_path, bytes)?;
 
-    // Verify before trusting the write -- read the just-written file back,
-    // not the in-memory `bytes` buffer, so a corrupt-on-disk write that
-    // still returned Ok is actually caught (same discipline as
-    // archive.rs::archive_transcript's verify-before-delete).
+    // Read the just-written file back, not the in-memory buffer, so a corrupt-on-disk write is actually caught.
     let written = std::fs::read(&obj_path)?;
     if written != bytes {
-        // Don't leave an object on disk that claims to be valid but isn't.
         let _ = std::fs::remove_file(&obj_path);
         return Err(CcrError::Io(format!(
             "write verification failed for handle {handle}: on-disk content didn't match"
@@ -187,10 +145,7 @@ fn touch_last_seen(meta_path: &Path) -> Result<(), CcrError> {
     Ok(())
 }
 
-/// Recover the exact original bytes for `handle`. Bumps `last_seen` on a
-/// hit -- a recently-recovered entry should outlive an untouched one under
-/// the same `gc` age cutoff. `handle` is validated before any filesystem
-/// access, so a malformed handle never even probes the object store.
+/// Recover the exact original bytes for `handle`, bumping `last_seen` on a hit. Malformed handles never probe the object store.
 pub fn get(ccr_root: &Path, handle: &str) -> Result<Vec<u8>, CcrError> {
     let hash = parse_handle(handle)?;
     let obj_path = object_path(ccr_root, hash);
@@ -198,8 +153,7 @@ pub fn get(ccr_root: &Path, handle: &str) -> Result<Vec<u8>, CcrError> {
         return Err(CcrError::NotFound);
     }
     let bytes = std::fs::read(&obj_path)?;
-    // Best-effort -- a sidecar touch failing must never fail the recovery
-    // itself; the bytes are already safely in hand.
+    // Best-effort -- a sidecar touch failing must never fail the recovery itself.
     let _ = touch_last_seen(&meta_path(ccr_root, hash));
     Ok(bytes)
 }
@@ -230,12 +184,7 @@ pub struct GcReport {
     pub bytes_freed: u64,
 }
 
-/// Evict entries older than `max_age`, then -- if still over `max_bytes` --
-/// evict oldest-by-`last_seen` until under the cap. Locked for the
-/// duration: this is the one CCR operation that deletes files, and a `get`
-/// racing a delete of the same object is the concern `put`/`get` alone
-/// don't have on their own (they're either idempotent or read-only against
-/// a file that, once written, is never mutated in place).
+/// Evict entries older than `max_age`, then -- if still over `max_bytes` -- evict oldest-by-`last_seen` until under the cap.
 pub fn gc(ccr_root: &Path, max_age: Duration, max_bytes: u64) -> Result<GcReport, CcrError> {
     std::fs::create_dir_all(ccr_root)?;
     let _guard = crate::lock::acquire(ccr_root).map_err(|e| CcrError::Io(e.to_string()))?;
@@ -281,11 +230,7 @@ struct ObjectMeta {
     size: u64,
 }
 
-/// Walk every stored object under `ccr_root`, returning
-/// `((object_path, meta_path), ObjectMeta)` pairs. A sidecar that's missing
-/// or corrupt is skipped, not a panic -- same "not a versioned contract"
-/// tolerance every other transcript/state reader in this crate applies
-/// (see `session_checkpoint.rs`'s doc comment).
+/// Walk every stored object under `ccr_root`. A sidecar that's missing or corrupt is skipped, not a panic.
 fn walk_objects(ccr_root: &Path) -> Vec<((PathBuf, PathBuf), ObjectMeta)> {
     let objects_dir = ccr_root.join("objects");
     let mut out = Vec::new();
@@ -305,9 +250,7 @@ fn walk_objects(ccr_root: &Path) -> Vec<((PathBuf, PathBuf), ObjectMeta)> {
                 if path.extension().and_then(|e| e.to_str()) != Some("bin") {
                     continue;
                 }
-                // "<hash>.bin" -> "<hash>" -> "<hash>.meta.json". Two
-                // `with_extension` calls rather than a string replace, since
-                // the hash body is pure hex and can't itself contain a dot.
+                // "<hash>.bin" -> "<hash>" -> "<hash>.meta.json".
                 let meta_path = path.with_extension("").with_extension("meta.json");
                 let Ok(contents) = std::fs::read_to_string(&meta_path) else {
                     continue;
@@ -338,8 +281,7 @@ mod tests {
         (tmp, root)
     }
 
-    /// Backdates a stored handle's `last_seen` for aging tests -- real time
-    /// doesn't need to pass to exercise `gc`'s cutoff logic.
+    /// Backdates a stored handle's `last_seen` so real time doesn't need to pass to exercise `gc`'s cutoff logic.
     fn backdate(root: &Path, handle: &str, seconds_ago: u64) {
         let hash = handle.strip_prefix(HANDLE_PREFIX).unwrap();
         let meta = meta_path(root, hash);
@@ -358,9 +300,7 @@ mod tests {
         assert_eq!(recovered, original);
     }
 
-    /// Binary-safety: a raw tool result can legitimately contain bytes that
-    /// aren't valid UTF-8 (embedded nulls, non-UTF-8 fragments). CCR must
-    /// not assume text.
+    /// Binary-safety: a raw tool result can legitimately contain non-UTF-8 bytes; CCR must not assume text.
     #[test]
     fn put_then_get_roundtrips_non_utf8_bytes_exactly() {
         let (_tmp, root) = ccr_root();
@@ -488,9 +428,7 @@ mod tests {
             "entry should survive the first gc"
         );
 
-        // A get() just touched last_seen to "now" -- backdate it again to
-        // simulate 5 more days passing, then gc at the same 7-day cutoff.
-        // Because get() reset the clock, it's only 5 days old again, not 10.
+        // get() reset the clock -- backdate again to simulate 5 more days, still only 5 days old, not 10.
         backdate(&root, &handle, 5 * 24 * 3600);
         gc(&root, Duration::from_secs(7 * 24 * 3600), u64::MAX).unwrap();
         assert!(

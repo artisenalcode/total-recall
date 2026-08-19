@@ -1,26 +1,11 @@
-//! Per-entry embedding cache — persists each wiki entry's window vectors
-//! alongside it, keyed by a content hash, so `wiki::semantic_search`
-//! doesn't have to re-embed every stored file on every single `recall`
-//! call. Invalidation is purely content-hash-based at read time: if the
-//! entry's current content hash doesn't match the cache's stored hash,
-//! the cache is stale and gets recomputed — no separate invalidate-on-
-//! write step needed, and correct regardless of *how* the content
-//! changed (this crate's own `write`, a hand edit, a git checkout, ...).
-//!
-//! Hand-rolled text format, not JSON — this crate has no `serde_json`
-//! dependency, and a small, controlled, internal-only cache file doesn't
-//! earn adding one (same reasoning `doctor.rs`'s hand-rolled JSON gives).
-//! Any parse failure returns `None`, never a hard error — the cache is
-//! always safely regenerable from the real content.
+//! Per-entry embedding cache, keyed by content hash, so `wiki::semantic_search` doesn't re-embed every file on every `recall` call.
+//! Hand-rolled text format, not JSON -- this crate has no `serde_json` dependency. Any parse failure returns `None`, never a hard error.
 
 use crate::atomic;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// One embedded window: its position in the source file plus the vector
-/// itself. `end_offset` (not a length) so a caller can slice
-/// `content[offset..end_offset]` directly, matching exactly what
-/// `window::windows` itself produced before trimming trailing whitespace.
+/// One embedded window. `end_offset` (not a length) so a caller can slice `content[offset..end_offset]` directly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedWindow {
     pub offset: usize,
@@ -34,9 +19,7 @@ pub struct EntryCache {
     pub windows: Vec<CachedWindow>,
 }
 
-/// Same `DefaultHasher` technique `wiki::slugify` already uses — no new
-/// hashing dependency, and this only needs to detect "did the content
-/// change," not resist adversarial collisions.
+/// Same `DefaultHasher` technique `wiki::slugify` uses -- only needs to detect "did the content change," not resist collisions.
 pub fn content_hash(content: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -52,9 +35,7 @@ fn cache_path(wiki_dir: &Path, slug: &str) -> PathBuf {
     cache_dir(wiki_dir).join(format!("{slug}.cache"))
 }
 
-/// `None` on a missing file, an I/O error, or any parse failure — the
-/// cache is always safely regenerable, so a caller should treat `None`
-/// exactly like "not cached yet," never propagate an error.
+/// `None` on a missing file, I/O error, or parse failure -- callers treat it exactly like "not cached yet."
 pub fn load(wiki_dir: &Path, slug: &str) -> Option<EntryCache> {
     let contents = fs::read_to_string(cache_path(wiki_dir, slug)).ok()?;
     parse(&contents)

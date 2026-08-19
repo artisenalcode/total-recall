@@ -1,9 +1,4 @@
-//! Black-box tests against the actual compiled `trm` binary — the real
-//! deployable artifact real callers (session_to_trm.py, a harness
-//! session typing commands directly) depend on. Unit tests in
-//! `src/*.rs` cover the internal logic; these cover the thing an actual
-//! consumer depends on: argv/stdin in, real bank on disk out. Same
-//! pattern as squishi's own `tests/cli.rs`.
+//! Black-box tests against the compiled `trm` binary -- argv/stdin in, real bank on disk out, same pattern as squishi's `tests/cli.rs`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -13,16 +8,8 @@ fn scratch_data_root() -> tempfile::TempDir {
     tempfile::tempdir().expect("failed to create scratch data root")
 }
 
-/// `ingest-session` shells out to the real `squishi` binary for
-/// extraction+compression (see ingest.rs's module doc) -- it's a hard
-/// dependency, not best-effort, so there's no in-process fallback to
-/// test instead. `squishi` lives in a sibling private repo; CI checks it
-/// out and builds it via a fine-grained PAT (`SQUISHI_CHECKOUT_PAT`, see
-/// this repo's CI workflow) when that secret is set. Locally, or on a
-/// fork/PR without the secret, it may not be on PATH -- skip gracefully
-/// rather than fail the whole suite on an environment gap that isn't a
-/// code regression; same resilience posture this codebase already
-/// applies to model/embedding availability elsewhere.
+/// `ingest-session` shells out to the real `squishi` binary; it's a hard dependency. Skip gracefully when it's not on PATH (e.g. a
+/// fork/PR without CI's `SQUISHI_CHECKOUT_PAT`) rather than fail the suite on an environment gap.
 fn squishi_on_path() -> bool {
     Command::new("squishi")
         .arg("--help")
@@ -53,10 +40,7 @@ fn run_trm_with_envs(
     cmd.output().expect("failed to run trm binary")
 }
 
-/// Backdate a file's mtime well past `RECENT_MTIME_GUARD_SECS` (10 min) --
-/// std has no mtime setter without a extra crate, and this is the one
-/// test that needs one, so shell out to the real `touch` instead of
-/// adding a dependency for a single call site.
+/// Backdate a file's mtime well past `RECENT_MTIME_GUARD_SECS` (10 min); std has no mtime setter, so shell out to `touch`.
 fn backdate_mtime(path: &std::path::Path) {
     let status = Command::new("touch")
         .arg("-d")
@@ -184,9 +168,7 @@ fn complete_handover_reads_from_stdin_when_no_argument_given() {
         .expect("stage should print a job id")
         .to_string();
 
-    // A result large enough that passing it as a positional argument
-    // would be exactly the fragile pattern retain/stage already moved
-    // away from -- the real motivation for this fix.
+    // Large enough that a positional argument would be exactly the fragile pattern retain/stage already moved away from.
     let large_result = format!("# A synthesized page\n\n{}", "real content ".repeat(2000));
     let output = run_trm_with_stdin(
         &["-p", "test-bank", "complete-handover", &job_id],
@@ -202,10 +184,7 @@ fn complete_handover_reads_from_stdin_when_no_argument_given() {
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("completed:"));
 }
 
-/// The whole trm/persona boundary (ADR-0009): a caller hands trm one
-/// manifest file, trm owns every internal detail of turning it into a
-/// pending job. Real artifact files (dedup/cluster/lexicon-shaped, but
-/// content doesn't matter here) referenced by path, not embedded.
+/// A caller hands trm one manifest file; real artifact files are referenced by path, not embedded.
 #[test]
 fn stage_persona_stages_a_job_from_a_manifest_referencing_real_artifacts() {
     let data_root = scratch_data_root();
@@ -241,9 +220,7 @@ fn stage_persona_stages_a_job_from_a_manifest_referencing_real_artifacts() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "staged: roy-sugarman");
 
-    // A real pending marker exists under the bank the MANIFEST named
-    // (no --bank flag was passed) and references the artifact path --
-    // proves trm read the manifest's fields, not just accepted the file.
+    // Proves trm read the manifest's own bank field and artifact path, not just accepted the file.
     let pending_path = data_root
         .path()
         .join("banks")
@@ -254,8 +231,7 @@ fn stage_persona_stages_a_job_from_a_manifest_referencing_real_artifacts() {
         .expect("pending marker should exist under the manifest's bank");
     assert!(pending_content.contains("roy-sugarman.dedup.json"));
 
-    // `trm pending --all` -- the real, cross-bank discovery surface
-    // this whole design exists to keep unified -- sees it.
+    // `trm pending --all`, the cross-bank discovery surface, sees it.
     let pending_output = run_trm(&["pending", "--all"], data_root.path());
     assert!(
         String::from_utf8_lossy(&pending_output.stdout).contains("roy-sugarman"),
@@ -283,30 +259,17 @@ fn stage_persona_rejects_a_manifest_missing_required_fields() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("missing required"));
 }
 
-/// No positional argument AND stdin is a real pipe with nothing written
-/// to it (immediate EOF, not a terminal) — a real, legitimate "empty
-/// content" case, distinct from the terminal-refusal path (which this
-/// black-box test can't easily simulate without a real pty). Confirms
-/// the empty-stdin path doesn't hang or crash; `retain`'s own downstream
-/// behavior on empty content is out of scope here.
+/// A real pipe with immediate EOF, not a terminal -- confirms the empty-stdin path doesn't hang or crash.
 #[test]
 fn retain_with_empty_piped_stdin_does_not_hang() {
     let data_root = scratch_data_root();
     let output = run_trm_with_stdin(&["-p", "test-bank", "retain"], data_root.path(), "");
-    // Whatever retain decides to do with empty content, the process must
-    // exit (not hang waiting for more stdin) — that's the real contract
-    // under test.
+    // The process must exit, not hang waiting for more stdin.
     assert!(output.status.code().is_some());
 }
 
-/// The one real behavioral requirement ported from session_to_trm.py:
-/// `ingest-session` must stage into the bank resolved from the
-/// SESSION's own cwd (parsed out of squishi's digest output), not
-/// whatever directory `trm` itself was invoked from. Sets up a fake
-/// "session repo" (dir A, with `.trm-bank` = a known marker) distinct
-/// from the real invocation cwd (dir B, no bank markers at all — would
-/// resolve to "global" if cwd resolution were used by mistake), and
-/// confirms the staged content lands in dir A's bank, not "global".
+/// `ingest-session` must stage into the bank resolved from the SESSION's own cwd, not the invoking process's -- confirms staged
+/// content lands in the session repo's bank, not "global" (what the invocation cwd, having no bank markers, would resolve to).
 #[test]
 fn ingest_session_stages_into_the_bank_resolved_from_the_session_s_own_cwd() {
     if !squishi_on_path() {
@@ -352,8 +315,6 @@ fn ingest_session_stages_into_the_bank_resolved_from_the_session_s_own_cwd() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("staged:"));
 
-    // Confirm it landed in the SESSION's bank, not "global" (which is
-    // what invocation_cwd, having no bank markers, would resolve to).
     let recall = run_trm(&["-p", "session-bank-marker", "pending"], data_root.path());
     let recall_stdout = String::from_utf8_lossy(&recall.stdout);
     assert!(
@@ -369,9 +330,7 @@ fn ingest_session_stages_into_the_bank_resolved_from_the_session_s_own_cwd() {
     );
 }
 
-/// ADR-0006 Phase 1's real point: `--archive-after` stages exactly as
-/// today, then gzip-archives the transcript into the resolved bank's
-/// `sessions/` tier and removes the original from disk.
+/// `--archive-after` stages, then gzip-archives the transcript into the resolved bank's `sessions/` tier and removes the original.
 #[test]
 fn ingest_session_archive_after_archives_and_removes_the_source_transcript() {
     if !squishi_on_path() {
@@ -493,11 +452,8 @@ fn ingest_session_skips_entirely_when_its_trigger_is_disabled_in_config() {
     );
 }
 
-/// The plan's key `--all` check: three transcripts in a fake
-/// `~/.claude/projects/`-shaped tree -- one already archived (checkpoint
-/// says so), one new/eligible, one belonging to the "currently running"
-/// session (`$CLAUDE_CODE_SESSION_ID`). Exactly the new one should get
-/// archived; the other two must be left completely untouched.
+/// Three transcripts: one already archived, one new/eligible, one belonging to the "currently running" session. Exactly the new
+/// one should get archived; the other two must be left completely untouched.
 #[test]
 fn ingest_sessions_all_archives_only_the_one_eligible_transcript() {
     if !squishi_on_path() {
@@ -533,9 +489,7 @@ fn ingest_sessions_all_archives_only_the_one_eligible_transcript() {
         backdate_mtime(path);
     }
 
-    // Pre-seed the checkpoint so sess-already reads as already archived --
-    // matches session_checkpoint::save's own format, written directly so
-    // this test doesn't depend on a prior `trm` run to set it up.
+    // Pre-seed the checkpoint so sess-already reads as already archived, matching session_checkpoint::save's format directly.
     let bank_dir = data_root.path().join("banks").join("sweep-bank");
     std::fs::create_dir_all(&bank_dir).unwrap();
     std::fs::write(
@@ -597,13 +551,10 @@ fn ingest_sessions_all_archives_only_the_one_eligible_transcript() {
     );
 }
 
-// --- --since-checkpoint (ADR-0006 Phase 2) ---
+// --- --since-checkpoint ---
 
-/// The real incremental contract, end to end through the real binary +
-/// real squishi subprocess: staging the same (growing) transcript twice
-/// with `--since-checkpoint` only adds new `raw/` content on the second
-/// call for what's actually new, and a third call with nothing new since
-/// then is a clean Skipped, not an error.
+/// Staging the same (growing) transcript twice with `--since-checkpoint` only adds new `raw/` content on the second call; a third
+/// call with nothing new is a clean Skipped, not an error.
 #[test]
 fn ingest_session_since_checkpoint_stages_only_the_delta_across_repeated_calls() {
     if !squishi_on_path() {
@@ -676,8 +627,7 @@ fn ingest_session_since_checkpoint_stages_only_the_delta_across_repeated_calls()
         "call 2 should stage exactly one new raw entry (the delta), not restage the whole transcript"
     );
 
-    // Call 3: nothing new since call 2 -- a clean skip, not an error, and
-    // no new raw/ entries.
+    // Call 3: nothing new since call 2 -- a clean skip, not an error.
     let output3 = run_trm(
         &[
             "ingest-session",
@@ -695,14 +645,11 @@ fn ingest_session_since_checkpoint_stages_only_the_delta_across_repeated_calls()
     let count_after_third = std::fs::read_dir(&raw_dir).unwrap().count();
     assert_eq!(count_after_third, count_after_second);
 
-    // Source transcript is never touched by --since-checkpoint (unlike
-    // --archive-after) -- still on disk, still the full two-turn content.
+    // Source transcript is never touched by --since-checkpoint (unlike --archive-after).
     assert!(transcript_path.exists());
 }
 
-/// `--archive-after` and `--since-checkpoint` are mutually exclusive
-/// (archival is for a finished session; since-checkpoint is for one
-/// that's still running) -- must fail before touching the transcript.
+/// `--archive-after` and `--since-checkpoint` are mutually exclusive -- must fail before touching the transcript.
 #[test]
 fn ingest_session_archive_after_and_since_checkpoint_cannot_combine() {
     let data_root = scratch_data_root();
@@ -732,10 +679,7 @@ fn ingest_session_archive_after_and_since_checkpoint_cannot_combine() {
     );
 }
 
-/// End-to-end: put via stdin, recover via the printed handle, bytes match
-/// exactly. `ccr-put`/`ccr-get` don't take `-p/--bank` -- the store is
-/// data-root scoped, not bank scoped -- so `run_trm` (no bank flag) is the
-/// right helper here, unlike most other commands in this file.
+/// End-to-end: put via stdin, recover via the printed handle, bytes match exactly. No `-p/--bank` -- the store is data-root scoped.
 #[test]
 fn ccr_put_then_get_round_trips_real_content_through_the_binary() {
     let data_root = scratch_data_root();
@@ -791,9 +735,7 @@ fn ccr_stats_reflects_a_real_put() {
     assert_eq!(value["total_bytes"], 13);
 }
 
-/// `ccr-gc --max-age-days 0` evicts everything immediately -- the cheapest
-/// real proof that the gc wiring (flag -> config default -> ccr::gc) is
-/// connected end to end through the actual binary, not just in-module.
+/// `ccr-gc --max-age-days 0` evicts immediately -- proves the gc wiring is connected end to end through the actual binary.
 #[test]
 fn ccr_gc_with_zero_max_age_evicts_a_just_stored_entry() {
     let data_root = scratch_data_root();
@@ -841,8 +783,7 @@ fn generate_man_writes_one_real_man_page_per_subcommand() {
         "missing a real documented flag: {ccr_gc}"
     );
 
-    // generate-man itself is a hidden dev-only subcommand -- must not
-    // appear in the user-facing man page it produces.
+    // Hidden dev-only subcommand -- must not appear in its own output.
     assert!(
         !top.contains("generate\\-man"),
         "hidden subcommand leaked into its own output"

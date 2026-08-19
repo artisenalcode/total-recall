@@ -1,10 +1,5 @@
-//! Per-file content-hash manifest for `trm graph update` (Step 5 of
-//! `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`).
-//! Lets `update` re-extract only files whose content actually changed
-//! since the last `build`/`update`, and remove nodes for files deleted
-//! since then. Reuses `embed_cache::content_hash` (a plain
-//! `DefaultHasher` over the file's text) rather than duplicating the
-//! same hashing choice a second time in this crate.
+//! Per-file content-hash manifest for `trm graph update` -- lets it re-extract only changed files and drop nodes for deleted ones.
+//! Reuses `embed_cache::content_hash` rather than duplicating the hashing choice.
 
 use crate::atomic;
 use serde::{Deserialize, Serialize};
@@ -15,10 +10,7 @@ use std::path::Path;
 pub struct Manifest(HashMap<String, u64>);
 
 impl Manifest {
-    /// A missing or unparseable file is treated as "no manifest yet" —
-    /// the first `update` on a bank with no prior graph is the normal
-    /// case, not a failure, exactly like `CodeGraph::load`'s own
-    /// missing-file handling.
+    /// A missing or unparseable file is "no manifest yet", not a failure -- matches `CodeGraph::load`'s missing-file handling.
     pub fn load(path: &Path) -> Self {
         std::fs::read_to_string(path)
             .ok()

@@ -1,21 +1,7 @@
 use crate::{atomic, bank, embeddings, handover, wiki};
 
-/// Local (no-API) duplicate-candidate finder: sentence-embedding cosine
-/// similarity between every pair of wiki entries, using the same model
-/// (all-MiniLM-L6-v2, local `candle` inference — see `embeddings.rs`'s
-/// module doc comment) mindforge's own `tools/dedupe_semantic.py` already
-/// uses via Python's fastembed — this is the Rust-native equivalent, not
-/// a call-out to Python. This is not
-/// a judgment — just a candidate finder. The actual merge/retire
-/// decision is a Curation handover (ADR-0002), same loop as extraction,
-/// handed to whichever harness invoked the scan. Returns the staged job
-/// ids.
-///
-/// Known limitation: all-MiniLM-L6-v2 has a fixed context window (256
-/// tokens by default); long wiki entries get truncated before embedding,
-/// so similarity is computed on the first ~256 tokens, not the full
-/// document. Fine for typical memory-file lengths; worth knowing before
-/// trusting this on much longer documents.
+/// Local duplicate-candidate finder: cosine similarity between every pair of wiki entries. Not a judgment -- stages Curation handovers for the harness.
+/// Known limitation: all-MiniLM-L6-v2's fixed 256-token context truncates long entries before embedding.
 pub fn scan(paths: &bank::BankPaths, threshold: f64) -> Result<Vec<String>, String> {
     let slugs = wiki::list(&paths.wiki).map_err(|e| e.to_string())?;
     if slugs.len() < 2 {
@@ -33,11 +19,7 @@ pub fn scan(paths: &bank::BankPaths, threshold: f64) -> Result<Vec<String>, Stri
     let mut staged = Vec::new();
     for i in 0..slugs.len() {
         for j in (i + 1)..slugs.len() {
-            // Karpathy's first-principles baseline: check the trivial,
-            // zero-tuning case before reaching for the embedding metric.
-            // An exact/contained match is a genuine duplicate with no
-            // threshold to get wrong, so it's staged separately and
-            // skips the embedding comparison entirely for this pair.
+            // Zero-tuning case: an exact/contained match skips the embedding comparison entirely.
             if is_exact_or_contained(&contents[i], &contents[j]) {
                 let job_id = format!("exact-dup-{}-{}", slugs[i], slugs[j]);
                 let reason = format!(
@@ -92,9 +74,7 @@ fn stage_candidate(
     )
 }
 
-/// True if the two contents are identical after trimming, or one is
-/// fully contained in the other — the trivial, zero-threshold duplicate
-/// case, checked before any embedding similarity metric.
+/// True if the two contents are identical after trimming, or one is fully contained in the other.
 fn is_exact_or_contained(a: &str, b: &str) -> bool {
     let (a, b) = (a.trim(), b.trim());
     if a.is_empty() || b.is_empty() {
@@ -186,8 +166,7 @@ mod tests {
     fn single_entry_bank_produces_no_candidates_without_loading_a_model() {
         let (_data_root, paths) = test_paths();
         wiki::write_named(&paths.wiki, "only-one", "a lone entry").unwrap();
-        // Only one entry means no pairs to compare — scan should return
-        // early and never construct an Embedder at all.
+        // No pairs to compare -- scan should return early, never construct an Embedder.
         assert!(scan(&paths, 0.6).unwrap().is_empty());
     }
 
@@ -197,9 +176,7 @@ mod tests {
         wiki::write_named(&paths.wiki, "a", "identical content here").unwrap();
         wiki::write_named(&paths.wiki, "b", "identical content here").unwrap();
 
-        // Threshold of 1.01 (above cosine's max of 1.0) would reject every
-        // embedding match, proving this pair was caught by the exact
-        // check, not the similarity pass.
+        // Threshold above cosine's max of 1.0 rejects every embedding match, proving the exact check caught this pair.
         let staged = scan(&paths, 1.01).unwrap();
         assert_eq!(staged.len(), 1);
         assert!(staged[0].starts_with("exact-dup-"));
@@ -222,9 +199,7 @@ mod tests {
         wiki::write_named(&paths.wiki, "a", "identical content here").unwrap();
         wiki::write_named(&paths.wiki, "b", "identical content here").unwrap();
 
-        // Low similarity threshold too — if the exact check didn't
-        // `continue`, this pair would also match the fuzzy pass and
-        // double-stage.
+        // Low threshold too -- if the exact check didn't `continue`, the fuzzy pass would also match and double-stage.
         let staged = scan(&paths, 0.1).unwrap();
         assert_eq!(
             staged.len(),
@@ -235,21 +210,7 @@ mod tests {
 
     #[test]
     fn scan_completes_within_a_bounded_time_at_realistic_bank_scale() {
-        // `scan` re-embeds every entry on every call (no content-hash
-        // skip-cache exists yet — flagged as a known gap, not fixed
-        // here). This is a tripwire, not a performance guarantee: it
-        // catches a future regression (or confirms a future cache
-        // actually helps) rather than asserting a specific budget is
-        // optimal. 50 entries is a realistic single-bank size, not a
-        // stress-test extreme. Budget is 90s, not 30s: CI runs `cargo
-        // test` in debug mode, and candle's matrix ops are dramatically
-        // slower unoptimized (measured 50.28s on GitHub's runner,
-        // 2026-08-19, vs sub-second in a --release build locally) — a
-        // debug-build tax, not a regression.
-        // Genuinely distinct topics, not a shared template with a number
-        // swapped in — a near-identical template embeds as near-identical
-        // regardless of the number, which would make every pair a false
-        // positive and defeat the point of a negative control.
+        // Tripwire, not a performance guarantee. 90s budget (not 30s) because CI's debug-mode candle matrix ops measured 50s on GitHub's runner.
         const TOPICS: [&str; 50] = [
             "the user prefers tabs over spaces in Python",
             "podman containers require explicit network setup on this host",
@@ -315,8 +276,7 @@ mod tests {
             elapsed.as_secs() < 90,
             "scan of 50 entries took {elapsed:?}, expected well under 90s"
         );
-        // Genuinely distinct topics at a high (0.9) threshold shouldn't
-        // false-positive into staged candidates.
+        // Genuinely distinct topics at a high (0.9) threshold shouldn't false-positive into staged candidates.
         assert!(staged.is_empty(), "unexpected candidates: {staged:?}");
     }
 

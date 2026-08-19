@@ -1,11 +1,5 @@
-//! Go structural extraction. Deterministic AST facts only.
-//!
-//! No `Implements` edges: Go's interface satisfaction is structural (no
-//! `implements` keyword anywhere in the source), so there is no AST fact
-//! to extract it from without real type-checking — out of scope for
-//! this MVP, same posture as skipping type inference elsewhere in this
-//! crate. `Trait`-kind nodes are still emitted for `interface` types (a
-//! useful node to `path`/`god-nodes` even with no incoming edges yet).
+//! Go structural extraction. Deterministic AST facts only. No `Implements` edges: Go's interface satisfaction is structural, with no
+//! AST fact to extract it from. `Trait`-kind nodes are still emitted for `interface` types.
 
 use crate::graph::model::{CodeGraph, EdgeKind, Node, NodeKind};
 use tree_sitter::Node as TsNode;

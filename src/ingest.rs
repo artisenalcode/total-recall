@@ -1,17 +1,5 @@
-//! `trm ingest-session` — Rust port of `mindforge/tools/session_to_trm.py`'s
-//! orchestration half. squishi owns extraction+compression
-//! (`squishi --session-digest`); this module owns the part squishi
-//! explicitly refuses to: calling `stage`. Keeps squishi's own stated
-//! boundary ("compresses text, never stores/retrieves") intact — the
-//! storage-owning tool is the one that calls storage.
-//!
-//! The one real behavioral requirement ported exactly from the Python
-//! version: the digest gets staged into the bank resolved from the
-//! *session's own* cwd (parsed out of squishi's output), not whatever
-//! directory `trm ingest-session` itself is invoked from. The Python
-//! version did this by setting the subprocess's own `cwd=`; here it's
-//! done by passing the parsed cwd straight into `bank::resolve_bank_id`
-//! instead of the ambient `std::env::current_dir()`.
+//! `trm ingest-session`: squishi owns extraction+compression (`squishi --session-digest`), this module owns calling `stage`.
+//! The digest stages into the bank resolved from the *session's own* cwd (parsed from squishi's output), not the invoking process's cwd.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -23,17 +11,11 @@ pub struct SessionDigest {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
     pub turn_count: usize,
-    /// squishi's real total line count for the transcript this digest
-    /// came from (ADR-0006 Phase 2) — independent of whatever `start_line`
-    /// the call used. An incremental caller (`--since-checkpoint`) saves
-    /// this as the session's new `last_staged_line`.
+    /// squishi's real total line count, independent of whatever `start_line` the call used. Saved as the session's new `last_staged_line`.
     pub total_lines: usize,
 }
 
-/// Parse `squishi --session-digest ... --json`'s real output shape.
-/// Pure and independently testable — the subprocess call itself
-/// (`run_squishi_session_digest_from`) is a thin wrapper around this
-/// plus real process I/O, exercised by the black-box CLI tests instead.
+/// Parse `squishi --session-digest ... --json`'s real output shape. Pure and independently testable.
 pub fn parse_squishi_json(json_str: &str) -> Result<SessionDigest, String> {
     let value: Value =
         serde_json::from_str(json_str).map_err(|e| format!("invalid JSON from squishi: {e}"))?;
@@ -78,13 +60,7 @@ pub fn build_reason(digest: &SessionDigest) -> String {
     )
 }
 
-/// Spawn `squishi --session-digest <path> --start-line <n> --json` and
-/// parse its output. `start_line` is 0 for a whole-file digest; an
-/// incremental caller (ADR-0006 Phase 2) passes the session's saved
-/// `last_staged_line` here and gets back only the delta. Real process
-/// I/O — not unit-tested directly (mocking a subprocess call buys
-/// nothing real); covered by the black-box CLI tests instead, same
-/// discipline as every other real-subprocess boundary in this project.
+/// Spawn `squishi --session-digest <path> --start-line <n> --json` and parse its output. Covered by black-box CLI tests, not mocked.
 pub fn run_squishi_session_digest_from(
     path: &Path,
     start_line: usize,
@@ -108,10 +84,7 @@ pub fn run_squishi_session_digest_from(
     parse_squishi_json(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Where `trm ingest-sessions --all` (ADR-0006 Phase 1) looks for
-/// transcripts. `MF_CLAUDE_PROJECTS_DIR` overrides for tests, same
-/// precedent as `bank::data_root`'s `MF_DATA_ROOT`; defaults to Claude
-/// Code's real, undocumented-but-observed layout, `~/.claude/projects`.
+/// Where `trm ingest-sessions --all` looks for transcripts. `MF_CLAUDE_PROJECTS_DIR` overrides for tests; defaults to `~/.claude/projects`.
 pub fn claude_projects_dir() -> PathBuf {
     if let Ok(over) = std::env::var("MF_CLAUDE_PROJECTS_DIR") {
         return PathBuf::from(over);
@@ -120,12 +93,7 @@ pub fn claude_projects_dir() -> PathBuf {
     PathBuf::from(home).join(".claude").join("projects")
 }
 
-/// Every `*.jsonl` file directly under `projects_dir`'s immediate
-/// subdirectories (`<projects_dir>/<project>/<session-id>.jsonl`, the
-/// real layout confirmed against this repo's own `~/.claude/projects/`).
-/// Defensive: an unreadable `projects_dir` or subdirectory yields fewer
-/// results, never a hard error — matches every other transcript-reading
-/// path in this codebase's "not a versioned contract" discipline.
+/// Every `*.jsonl` file under `projects_dir`'s immediate subdirectories. Unreadable dirs yield fewer results, never a hard error.
 pub fn find_transcripts(projects_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(project_dirs) = std::fs::read_dir(projects_dir) else {
@@ -150,12 +118,7 @@ pub fn find_transcripts(projects_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A cheap peek at a transcript's `sessionId`/`cwd`, without spawning
-/// squishi — just the first line that carries both non-null (skips the
-/// real, observed leading `{"type":"mode", ..., "cwd": null}` line).
-/// Lets `ingest-sessions --all` resolve which bank's checkpoint to check
-/// *before* paying for a real digest, for sessions it's about to skip
-/// anyway.
+/// A cheap peek at a transcript's `sessionId`/`cwd` without spawning squishi -- the first line carrying both non-null.
 pub fn peek_session_meta(path: &Path) -> Option<(String, PathBuf)> {
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
@@ -180,7 +143,7 @@ pub fn peek_session_meta(path: &Path) -> Option<(String, PathBuf)> {
 mod tests {
     use super::*;
 
-    // --- find_transcripts / peek_session_meta: pure(ish), real fixture dirs ---
+    // --- find_transcripts / peek_session_meta ---
 
     #[test]
     fn find_transcripts_finds_jsonl_under_project_subdirectories() {
@@ -229,10 +192,7 @@ mod tests {
         assert!(peek_session_meta(&path).is_none());
     }
 
-    /// Real shape — matches squishi's actual `--session-digest --json`
-    /// output exactly (verified live against the real binary before
-    /// this fixture was written, not guessed; `total_lines` added
-    /// ADR-0006 Phase 2, reverified live the same way).
+    /// Real shape -- matches squishi's actual `--session-digest --json` output, verified live against the real binary.
     const REAL_SHAPE_JSON: &str = r#"{"chars_after":100,"chars_before":200,"content":"SESSION DIGEST sess-1\n\n---\ntype: session-digest\nsession_id: sess-1\ncwd: /repo\nfirst_ts: t1\nlast_ts: t2\nturn_count: 3\n---\n\nbody","cwd":"/repo","first_ts":"t1","last_ts":"t2","raw_bytes":9000,"session_id":"sess-1","total_lines":5,"truncated":false,"turn_count":3}"#;
 
     #[test]

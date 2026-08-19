@@ -1,21 +1,9 @@
-//! Embedder-based node-name matching for `trm graph query` (the rest of
-//! Step 6 of `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`).
-//!
-//! Deliberately reuses `total-recall`'s existing local-only `Embedder`
-//! for cosine-similarity matching against node *names* — no natural-
-//! language reasoning, no LLM call, unlike graphify's own `query`
-//! command. A query like "the thing that saves the graph" ranks nodes
-//! whose *name* text embeds close to it; it does not read node bodies or
-//! reason about what a node does.
+//! Embedder-based node-name matching for `trm graph query` -- cosine similarity against node *names* only, no LLM, no body reasoning.
 
 use crate::embeddings::{Embedder, cosine_similarity};
 use crate::graph::model::CodeGraph;
 
-/// Rank every node in `graph` by cosine similarity between its `name`
-/// and `query`, highest first, truncated to `limit`. Returns `(node id,
-/// score)` pairs — the id (not the name) is what every other query verb
-/// in this module already takes as input, so a caller can feed a result
-/// straight into `shortest_path`/`god_nodes` lookups.
+/// Rank every node by cosine similarity between its `name` and `query`, highest first, truncated to `limit`. Returns `(node id, score)`.
 pub fn semantic_query(
     graph: &CodeGraph,
     query: &str,

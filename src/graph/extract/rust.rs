@@ -1,11 +1,4 @@
-//! Rust-specific structural extraction (originally Step 4 of
-//! `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`,
-//! since generalized to a per-language module — see `extract/mod.rs`).
-//!
-//! Deterministic AST facts only. Explicitly **not** attempted here: macro
-//! expansion, cross-crate resolution, or real type inference — `Calls` and
-//! `Implements` edges are resolved by matching an identifier's short text
-//! against node *names* already seen in the same extraction run.
+//! Rust-specific structural extraction. Deterministic AST facts only -- no macro expansion, cross-crate resolution, or type inference.
 
 use crate::graph::model::{CodeGraph, EdgeKind, Node, NodeKind};
 use tree_sitter::Node as TsNode;
@@ -18,11 +11,8 @@ fn text(node: &TsNode, source: &str) -> String {
     source[node.byte_range()].to_string()
 }
 
-/// Recursively walk `node`'s direct item children, emitting nodes/edges
-/// into `graph`. `current_impl_type` is `Some(type_name)` only while
-/// walking the body of an `impl` block, so a method's stable id can be
-/// scoped under its type (`file.rs::Type::method`) instead of colliding
-/// with a free function of the same name.
+/// Recursively walk `node`'s direct item children. `current_impl_type` is `Some` only inside an `impl` block, scoping a method's id
+/// under its type (`file.rs::Type::method`) instead of colliding with a free function of the same name.
 pub fn extract_items(
     node: TsNode,
     source: &str,
@@ -79,8 +69,7 @@ pub fn extract_items(
                 }
             }
             "trait_item" => {
-                // Node only, not its default methods — default-method
-                // extraction is future scope, not attempted here.
+                // Node only, not its default methods.
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = text(&name_node, source);
                     let id = format!("{rel}::{name}");
@@ -115,11 +104,8 @@ pub fn extract_items(
     }
 }
 
-/// Recursively collect every `call_expression` under `node` into
-/// `pending_calls` as `(caller_id, callee_short_name)`. Does not descend
-/// into nested item definitions specially — a closure or nested `fn`'s
-/// calls are still attributed to the enclosing function, an accepted
-/// simplification for MVP granularity.
+/// Recursively collect every `call_expression` under `node` as `(caller_id, callee_short_name)`. A closure/nested `fn`'s calls are
+/// still attributed to the enclosing function.
 fn collect_calls(
     node: TsNode,
     source: &str,
@@ -138,10 +124,7 @@ fn collect_calls(
     }
 }
 
-/// The short, identifier-level name a call expression's callee resolves
-/// to for name-matching purposes: `foo()` -> `foo`, `Foo::new()` ->
-/// `new`, `self.foo()` -> `foo`. Anything else yields `None` and is
-/// simply not resolved — no error, just an edge that doesn't get added.
+/// The short callee name for name-matching: `foo()` -> `foo`, `Foo::new()` -> `new`, `self.foo()` -> `foo`. Else `None`, no error.
 fn callee_name(node: TsNode, source: &str) -> Option<String> {
     match node.kind() {
         "identifier" => Some(text(&node, source)),

@@ -1,11 +1,5 @@
-//! In-memory code graph model + its on-disk `graph.json` representation
-//! (Step 3 of `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`).
-//!
-//! Deliberately a thin, hand-shaped model — `File`/`Function`/`Struct`/
-//! `Enum`/`Trait`/`Impl` nodes, `Contains`/`Calls`/`Implements`/`Uses`
-//! edges — not graphify's full taxonomy. No confidence/audit-trail tiers
-//! (EXTRACTED/INFERRED/AMBIGUOUS): every edge this crate ever writes is a
-//! deterministic AST fact, so that distinction doesn't apply here.
+//! In-memory code graph model + its on-disk `graph.json` representation. Thin, hand-shaped: no confidence/audit tiers, every edge is a
+//! deterministic AST fact.
 
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
@@ -32,30 +26,20 @@ pub enum EdgeKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
-    /// Stable, human-readable id — e.g. `src/foo.rs::FooStruct::new` — the
-    /// on-disk join key across `build`/`update` runs and every query verb's
-    /// user-facing handle. Not `petgraph`'s own `NodeIndex`, which is only
-    /// stable for the lifetime of one in-memory graph and would silently
-    /// break across the very next `update`.
+    /// Stable, human-readable id (e.g. `src/foo.rs::FooStruct::new`), not `petgraph`'s own `NodeIndex` which breaks across the next `update`.
     pub id: String,
     pub kind: NodeKind,
     pub name: String,
 }
 
-/// On-disk shape of `graph.json` — plain nodes plus edges addressed by
-/// node id, not `petgraph`'s own internal representation. Keeps the file
-/// human-readable and independent of `petgraph`'s index layout, which
-/// shifts across mutations and was never meaningful across separate
-/// `build`/`update` runs to begin with.
+/// On-disk shape of `graph.json` -- plain nodes plus edges addressed by node id, independent of `petgraph`'s shifting index layout.
 #[derive(Debug, Serialize, Deserialize)]
 struct GraphFile {
     nodes: Vec<Node>,
     edges: Vec<(String, String, EdgeKind)>,
 }
 
-/// In-memory graph plus the id→index lookup every caller needs —
-/// extraction, incremental update, and every query verb all address
-/// nodes by their stable `id`, never by `NodeIndex` directly.
+/// In-memory graph plus the id→index lookup -- every caller addresses nodes by their stable `id`, never by `NodeIndex` directly.
 #[derive(Debug, Default)]
 pub struct CodeGraph {
     pub graph: DiGraph<Node, EdgeKind>,
@@ -67,11 +51,7 @@ impl CodeGraph {
         Self::default()
     }
 
-    /// Insert a node if `id` isn't already present, else overwrite its
-    /// weight in place; returns its index either way. Idempotent by
-    /// design — extraction re-inserts the same file's nodes on every
-    /// `update` pass, and this is the one place that has to tolerate that
-    /// without producing duplicates.
+    /// Insert a node if `id` isn't present, else overwrite its weight in place; returns its index either way. Idempotent by design.
     pub fn upsert_node(&mut self, node: Node) -> NodeIndex {
         if let Some(&idx) = self.index.get(&node.id) {
             self.graph[idx] = node;
@@ -88,12 +68,7 @@ impl CodeGraph {
         self.index.get(id).copied()
     }
 
-    /// Best-effort lookup by kind + display name, not by stable id — used
-    /// to resolve a `Calls`/`Implements` target when extraction only has an
-    /// identifier's short name to go on (no full type resolution). Picks
-    /// the first match encountered; a real ambiguity (two functions named
-    /// `new` in the same extraction run) is an accepted MVP imprecision,
-    /// not a bug — see the plan doc's Risks section.
+    /// Best-effort lookup by kind + display name, for resolving a `Calls`/`Implements` target with no full type resolution. First match wins.
     pub fn find_by_name(&self, kind: NodeKind, name: &str) -> Option<String> {
         self.graph
             .node_weights()
@@ -101,12 +76,7 @@ impl CodeGraph {
             .map(|n| n.id.clone())
     }
 
-    /// Add an edge between two already-inserted node ids. Returns `false`
-    /// (no panic) if either endpoint isn't present yet — extraction runs
-    /// emit nodes before edges within one file, but a `Calls` edge can
-    /// legitimately target a not-yet-extracted or unresolved function; the
-    /// caller decides whether that's worth logging, this layer just
-    /// reports it didn't happen.
+    /// Add an edge between two already-inserted node ids. Returns `false` (no panic) if either endpoint isn't present yet.
     pub fn add_edge(&mut self, from: &str, to: &str, kind: EdgeKind) -> bool {
         match (self.index.get(from), self.index.get(to)) {
             (Some(&f), Some(&t)) => {
@@ -117,19 +87,8 @@ impl CodeGraph {
         }
     }
 
-    /// Remove every node belonging to any of `rels` (a file's own `File`
-    /// node, plus every item node whose id is scoped under it —
-    /// `"{rel}::..."`) along with every edge touching them. Used by
-    /// incremental `update` to drop a changed or deleted file's stale
-    /// nodes before re-extracting it (or, for a deletion, before simply
-    /// leaving it out).
-    ///
-    /// Rebuilds the graph from scratch rather than calling `petgraph`'s
-    /// own `remove_node` in a loop — `remove_node` uses swap-remove
-    /// semantics that silently invalidate other nodes' `NodeIndex`
-    /// values, which would desync `self.index`. A full rebuild is O(n)
-    /// either way and this crate's graphs are one-codebase-sized, not
-    /// worth the bookkeeping to avoid.
+    /// Remove every node belonging to any of `rels` (a file's own node plus every item scoped under it) and every edge touching them.
+    /// Rebuilds from scratch rather than looping `petgraph`'s `remove_node`, whose swap-remove semantics would desync `self.index`.
     pub fn remove_files(&mut self, rels: &std::collections::HashSet<String>) {
         let belongs_to_removed = |id: &str| {
             rels.iter()
@@ -171,8 +130,7 @@ impl CodeGraph {
         self.graph.edge_count()
     }
 
-    /// Serialize to `graph.json` at `path` — atomic write, same discipline
-    /// every other durable file in this crate already follows.
+    /// Serialize to `graph.json` at `path`, atomically.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let nodes: Vec<Node> = self.graph.node_weights().cloned().collect();
         let edges: Vec<(String, String, EdgeKind)> = self
@@ -190,9 +148,7 @@ impl CodeGraph {
         crate::atomic::write(path, &json)
     }
 
-    /// Load from `graph.json` at `path`. A missing file yields an empty
-    /// graph rather than an error — `trm graph build` on a bank with no
-    /// prior graph is the normal first-run case, not a failure.
+    /// Load from `graph.json` at `path`. A missing file yields an empty graph, not an error -- the normal first-run case.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         if !path.exists() {
             return Ok(Self::new());

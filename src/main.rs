@@ -38,10 +38,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Store a single fact directly into the resolved bank's wiki tier.
-    /// Omit `content` to read from stdin instead — no shell-argument size
-    /// limit, no quoting/escaping fragility for large content (unlike a
-    /// positional argument, which Linux caps around 128KB per element).
+    /// Store a single fact directly into the resolved bank's wiki tier. Omit `content` to read from stdin instead.
     Retain {
         /// The fact to store. Omit to read from stdin instead.
         content: Option<String>,
@@ -51,31 +48,18 @@ enum Commands {
         /// Substring to search for.
         query: String,
     },
-    /// Stage raw content for a sub-agent handover (extraction), per ADR-0002.
-    /// Omit `content` to read from stdin instead — same reasoning as `retain`.
+    /// Stage raw content for a sub-agent handover (extraction). Omit `content` to read from stdin instead.
     Stage {
         /// The content to stage. Omit to read from stdin instead.
         content: Option<String>,
-        /// Why this is being staged -- shown to the sub-agent completing
-        /// the handover.
+        /// Why this is being staged -- shown to the sub-agent completing the handover.
         #[arg(long)]
         reason: String,
-        /// Provenance label. "direct" (default) is trusted; anything else
-        /// (e.g. "web-scrape") is flagged UNTRUSTED in the handover prompt.
+        /// Provenance label; "direct" (default) is trusted, anything else is flagged UNTRUSTED in the handover prompt.
         #[arg(long, default_value = "direct")]
         source: String,
     },
-    /// Stage a persona-build handover from an external tool's payload
-    /// manifest — the whole trm/persona boundary (ADR-0009): a caller
-    /// hands trm one JSON file, trm owns every internal detail of how
-    /// it becomes a pending job. Manifest shape:
-    /// `{ slug, bank, description, source_label, self_build, artifacts: [paths] }`
-    /// -- `artifacts` is untyped from trm's side, just "files worth a
-    /// sub-agent reading" (dedup sidecars, cluster/lexicon output,
-    /// whatever the caller produced). `--bank` (the global flag) is an
-    /// override; the manifest's own `bank` field is used otherwise --
-    /// no cwd-based resolution, since an external caller has no
-    /// meaningful cwd relationship to a bank.
+    /// Stage a persona-build handover from an external tool's JSON payload manifest: `{ slug, bank, description, source_label, self_build, artifacts: [paths] }`.
     StagePersona {
         /// Path to the payload manifest JSON file.
         #[arg(long)]
@@ -87,31 +71,22 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// Print a pending job's exact rendered prompt — feed this verbatim to
-    /// a sub-agent to complete the handover.
+    /// Print a pending job's exact rendered prompt — feed this verbatim to a sub-agent to complete the handover.
     PendingShow {
         /// Job id from `pending`'s output.
         job_id: String,
     },
-    /// Scan the resolved bank for duplicate-candidate wiki entries
-    /// (word-overlap heuristic, no LLM) and stage Curation handovers
-    /// for any pair above the threshold.
+    /// Scan the resolved bank for duplicate-candidate wiki entries and stage Curation handovers for any pair above the threshold.
     CuratorScan {
-        /// Word-overlap similarity above which a pair is flagged as a
-        /// duplicate candidate (0.0-1.0).
+        /// Similarity above which a pair is flagged as a duplicate candidate (0.0-1.0).
         #[arg(long, default_value_t = 0.8)]
         threshold: f64,
     },
-    /// Commit a completed handover's result (called by the harness after
-    /// a sub-agent finished the judgment work `trm` couldn't do itself).
-    /// Omit `result` to read from stdin instead -- same reasoning as
-    /// `retain`/`stage`: a synthesized persona wiki page can run to tens
-    /// of KB, well past comfortable argv territory.
+    /// Commit a completed handover's result. Omit `result` to read from stdin instead.
     CompleteHandover {
         /// Job id from `pending`'s output.
         job_id: String,
-        /// The completed handover's result. Omit to read from stdin
-        /// instead — a synthesized wiki page can run to tens of KB.
+        /// The completed handover's result. Omit to read from stdin instead.
         result: Option<String>,
     },
     /// Serve live usage docs, so the skill stub never goes stale.
@@ -119,17 +94,12 @@ enum Commands {
         #[command(subcommand)]
         action: SkillAction,
     },
-    /// No-LLM, AST-derived code graph (Rust, TypeScript/TSX,
-    /// JavaScript, Go, Python) — see
-    /// `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`.
+    /// No-LLM, AST-derived code graph (Rust, TypeScript/TSX, JavaScript, Go, Python).
     Graph {
         #[command(subcommand)]
         action: GraphAction,
     },
-    /// One-off migration: recursively import every *.md file under
-    /// `source` into a bank, preserving relative filenames as slugs
-    /// (minus a `MEMORY.md` index file, which is skipped — it's an
-    /// index, not a fact).
+    /// One-off migration: recursively import every *.md file under `source` into a bank as slugs (skips `MEMORY.md`, an index not a fact).
     Import {
         /// Directory to recursively import every `*.md` file from.
         source: PathBuf,
@@ -137,49 +107,32 @@ enum Commands {
         #[arg(long)]
         bank: String,
     },
-    /// Self-diagnostics: data root/model-cache permissions, bank
-    /// resolution, lock staleness, whether the embedder actually loads.
-    /// Read-only by default; --fix reclaims a real stale lock, the one
-    /// repairable thing in this surface today.
+    /// Self-diagnostics: data root/model-cache permissions, bank resolution, lock staleness, embedder load. Read-only by default.
     Doctor {
         /// Skip the real embedder-load check (network-capable, slower).
         #[arg(long)]
         quick: bool,
-        /// Reclaim a stale lock, if the resolved bank has one. The only
-        /// mutation this command ever makes, and only with this flag.
+        /// Reclaim a stale lock, if the resolved bank has one -- the only mutation this command ever makes.
         #[arg(long)]
         fix: bool,
         /// Emit machine-readable JSON instead of the plain-text report.
         #[arg(long)]
         json: bool,
     },
-    /// Store `content`'s bytes in the content-addressed recovery store and
-    /// print the handle. Data-root scoped, NOT bank scoped -- the same
-    /// blob recurring across two different repos' sessions shares one
-    /// stored object. Omit `content` to read raw bytes from stdin (no
-    /// UTF-8 assumption, unlike every other stdin-reading command here --
-    /// a compressed-away tool result can legitimately be non-UTF-8).
+    /// Store `content`'s bytes in the content-addressed recovery store and print the handle. Data-root scoped, NOT bank scoped.
     CcrPut {
-        /// Bytes to store. Omit to read raw bytes from stdin instead (no
-        /// UTF-8 assumption).
+        /// Bytes to store. Omit to read raw bytes from stdin instead (no UTF-8 assumption).
         content: Option<String>,
-        /// Informational only (e.g. squishi's `kind` field) -- never used
-        /// for lookup, which is purely content-hash based.
+        /// Informational only -- never used for lookup, which is purely content-hash based.
         #[arg(long)]
         kind: Option<String>,
     },
-    /// Recover the exact original bytes for a handle printed by
-    /// `ccr-put`. Writes raw bytes to stdout -- never adds or strips so
-    /// much as a trailing newline.
+    /// Recover the exact original bytes for a handle printed by `ccr-put`, written raw to stdout.
     CcrGet {
         /// Handle printed by `ccr-put` (`ccr_<16 hex chars>`).
         handle: String,
     },
-    /// Evict CCR entries: first anything older than the age cutoff, then
-    /// -- if the store is still over the byte cap -- oldest-by-last-use
-    /// until under it. Flags override `trm.json`'s `ccr.max_age_days` /
-    /// `ccr.max_bytes`, which override the built-in defaults (3 days,
-    /// 500MB).
+    /// Evict CCR entries past the age cutoff, then oldest-by-last-use if still over the byte cap.
     CcrGc {
         /// Override `trm.json`'s `ccr.max_age_days` (built-in default: 3).
         #[arg(long)]
@@ -194,67 +147,27 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Sweep every transcript under `~/.claude/projects/` (`
-    /// MF_CLAUDE_PROJECTS_DIR` overrides, for tests) not yet archived,
-    /// staging+archiving each (ADR-0006 Phase 1). Resumable: a second run
-    /// is a no-op over sessions already archived. Never touches the
-    /// transcript belonging to `$CLAUDE_CODE_SESSION_ID` (the invoking
-    /// process's own live session, if any) regardless of its age, and
-    /// skips anything modified in the last 10 minutes as a secondary
-    /// guard against archiving a file some other still-running session
-    /// might append to next.
+    /// Sweep every transcript under `~/.claude/projects/` not yet archived, staging+archiving each. Resumable, skips live/recent sessions.
     IngestSessions {
-        /// Required, not a default-true flag -- an explicit ask, not
-        /// something that happens by just running the bare subcommand
-        /// (there's no other mode today, but making it implicit now
-        /// forecloses a future narrower selection flag reading as a
-        /// silent behavior change).
+        /// Required rather than default-true -- an explicit ask, not implicit behavior of the bare subcommand.
         #[arg(long)]
         all: bool,
     },
-    /// Extract + compress a Claude Code session transcript (via the real
-    /// `squishi --session-digest`) and stage the result for handover.
-    /// Rust port of `session_to_trm.py`. Stages into the bank resolved
-    /// from the SESSION's own cwd (parsed from squishi's output), not
-    /// the cwd `trm` itself is invoked from -- `-p/--bank` still
-    /// overrides both if given explicitly.
+    /// Extract + compress a session transcript (via `squishi --session-digest`) and stage it for handover; bank resolves from the session's own cwd.
     IngestSession {
         /// Path to the Claude Code session transcript (JSONL).
         path: PathBuf,
-        /// After staging succeeds, gzip-archive the transcript into the
-        /// resolved bank's `sessions/` tier and remove the original from
-        /// its source location. Only safe for a FINISHED session (ADR-0006
-        /// Phase 1) -- never pass this for a still-live transcript. Cannot
-        /// be combined with --since-checkpoint (see its own doc comment).
+        /// Gzip-archive the transcript after staging and remove the original. Only safe for a FINISHED session; cannot combine with --since-checkpoint.
         #[arg(long)]
         archive_after: bool,
-        /// Stage only the delta since this session's last staged line
-        /// (ADR-0006 Phase 2), instead of the whole transcript -- the
-        /// live, in-session counterpart to --archive-after's
-        /// finished-session archival. Resolves the bank from a cheap
-        /// peek at the transcript (no full digest needed just to find
-        /// the checkpoint), loads that bank's saved `last_staged_line`,
-        /// passes it to squishi as `--start-line`, and advances the
-        /// checkpoint to the new `total_lines` on success. "Nothing new
-        /// since last checkpoint" is a normal outcome (Skipped), not a
-        /// failure. Cannot be combined with --archive-after: archiving is
-        /// for a session that's finished, since-checkpoint is for one
-        /// that's still running -- combining them risks archiving (and
-        /// deleting) a transcript a live Claude Code process may still
-        /// have open.
+        /// Stage only the delta since this session's last staged line. Live-session counterpart to --archive-after; cannot combine with it.
         #[arg(long)]
         since_checkpoint: bool,
-        /// Which trigger is calling this. `manual` (default, this
-        /// command's original behavior) is never gated by `trm.json`'s
-        /// hook-enable flags; `precompact`/`sessionend` are -- a disabled
-        /// hook exits 0 silently rather than staging anyway.
+        /// Which trigger is calling this; `precompact`/`sessionend` are gated by `trm.json`'s hook-enable flags, `manual` never is.
         #[arg(long, value_enum, default_value = "manual")]
         trigger: Trigger,
     },
-    /// Write real roff(7) man pages (one per subcommand) to this
-    /// directory. Regenerated from this exact `Commands` definition via
-    /// `clap_mangen` — every subcommand's doc comment above becomes its
-    /// man page's DESCRIPTION, so the two can never drift.
+    /// Write real roff(7) man pages (one per subcommand) to this directory, via `clap_mangen` off this exact `Commands` definition.
     #[command(hide = true)]
     GenerateMan {
         /// Directory to write trm.1, trm-retain.1, etc.
@@ -262,9 +175,7 @@ enum Commands {
     },
 }
 
-/// Which caller is invoking `ingest-session` (ADR-0006 Phase 1). `manual`
-/// is the pre-existing, ungated behavior; `precompact`/`sessionend` are
-/// checked against `trm.json`'s `hooks.*.enabled` before staging anything.
+/// Which caller is invoking `ingest-session`; `precompact`/`sessionend` are gated by `trm.json`'s `hooks.*.enabled`, `manual` isn't.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 #[value(rename_all = "lowercase")]
 enum Trigger {
@@ -347,7 +258,7 @@ replaced an earlier grep-based version entirely. Prints `<score>  <slug>:
 <snippet>` for the top 5 matches scoring >= 0.3 cosine similarity, or "no
 matches" if none. Same bank-resolution rules as retain.
 
-Windowed since 2026-08-07 (ADR-0004): a long entry is split into
+A long entry is split into
 overlapping ~80-word windows before embedding, scored per window, best
 score wins — a whole-file-as-one-vector approach used to hard-truncate
 anything past ~211-261 words (found empirically; the original documented
@@ -360,7 +271,7 @@ is the write-time complement, keeping newly-staged entries small and
 mostly-single-topic in the first place rather than relying on windowing
 alone to recover from a large blob.
 
-## Handover (extraction/curation trm can't do itself — see ADR-0002)
+## Handover (extraction/curation trm can't do itself)
 
     trm stage "<raw content>" --reason "<why this needs judgment>" [--source direct]
     <content-source> | trm stage --reason "..." [--source direct]   # stdin, since 2026-08-07
@@ -379,8 +290,8 @@ its bank the same way — code archaeology resolves from the target repo
 path, not the invoking directory). `pending-show <job-id>` prints a job's
 exact rendered prompt — feed this verbatim to a sub-agent.
 
-**Content over ~2000 chars gets concept-pre-split automatically**
-(ADR-0004, 2026-08-07): `stage` deterministically splits large/ambiguous
+**Content over ~2000 chars gets concept-pre-split automatically:**
+`stage` deterministically splits large/ambiguous
 content into candidate concepts (sentence-level, near-duplicate-collapsed
 — same algorithm `advisory/tools/dedupe_semantic.py` proved out) *before*
 rendering the prompt. **If you're the sub-agent handling a handover whose
@@ -503,7 +414,7 @@ whatever directory `trm ingest-session` itself is invoked from —
 `-p/--bank` still overrides both if given explicitly. Fails loudly if
 `squishi` isn't on PATH or the session has nothing to digest (empty).
 
-**Archival (ADR-0006 Phase 1, for a FINISHED session only).**
+**Archival (for a FINISHED session only).**
 `--archive-after` gzip-archives the transcript into the resolved bank's
 `sessions/<session-id>.jsonl.gz` and removes the source once staging
 succeeds — the source is only ever deleted after the compressed copy is
@@ -522,8 +433,8 @@ matching pre-`trm.json` behavior). See `<data_root>/trm.json` (global)
 and `<repo_root>/.trm/trm.json` (project override, merged field-by-field
 on top) for the full schema.
 
-**Live, in-session staging (ADR-0006 Phase 2, for a STILL-RUNNING session
-only — never combine with `--archive-after`).** `--since-checkpoint`
+**Live, in-session staging (for a STILL-RUNNING session only — never
+combine with `--archive-after`).** `--since-checkpoint`
 stages only the delta since this session's last saved checkpoint line,
 instead of the whole transcript: resolves the bank from a cheap peek at
 the transcript (no full digest needed just to find the checkpoint), asks
@@ -552,11 +463,11 @@ receiving side of the handover contract: `persona`'s `stage-synthesis`
 shells out to `trm stage-persona --manifest <path>`, which stages a
 `PersonaBuild` handover exactly like any other — **never concept-split**
 (that's the wrong shape for this job; see `handover.rs`'s own doc
-comment on why, dated 2026-08-07). `trm pending-show <job-id>` prints
-the real, embedded synthesis criteria (co-developed with a real
-clinical-psychology advisor in this store) for the sub-agent completing
-the job. Mechanical only — trm never calls an LLM itself, per ADR-0002;
-synthesis happens when a sub-agent reads the pending prompt and writes
+comment on why). `trm pending-show <job-id>` prints the real, embedded
+synthesis criteria (co-developed with a real clinical-psychology advisor
+in this store) for the sub-agent completing the job. Mechanical only —
+trm never calls an LLM itself; synthesis happens when a sub-agent reads
+the pending prompt and writes
 the actual wiki page via `trm complete-handover`.
 
 ## Code graph (Rust, TypeScript/TSX, JavaScript, Go, Python)
@@ -1041,9 +952,7 @@ fn main() -> ExitCode {
             match action {
                 GraphAction::Build { path } => match graph::extract::extract_dir(&path) {
                     Ok(g) => {
-                        // Also (re)write the manifest from this fresh extraction
-                        // so a later `trm graph update` diffs against real
-                        // content hashes instead of treating every file as new.
+                        // (Re)write the manifest so a later `trm graph update` diffs against real content hashes, not "every file is new".
                         let manifest = graph::extract::manifest_for(&path)
                             .unwrap_or_else(|_| graph::manifest::Manifest::default());
                         match g
@@ -1171,14 +1080,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Resolve the bank and search its wiki tier. No lock needed — reads
-/// don't contend with the lease lock, which only guards writes.
-/// Semantic recall: top 5 wiki entries scoring at or above 0.3 cosine
-/// similarity to the query. Threshold chosen conservatively (lower than
-/// curator-scan's 0.8 document-to-document default) since a short query
-/// against a full document naturally scores lower than two documents
-/// compared to each other — validate against real recall queries before
-/// tightening further.
+/// Semantic recall: top 5 wiki entries scoring at or above 0.3 cosine similarity to the query. No lock needed -- reads don't contend with the lease lock.
 fn recall(
     data_root: &std::path::Path,
     cwd: &std::path::Path,
@@ -1191,9 +1093,7 @@ fn recall(
     wiki::semantic_search(&paths.wiki, query, &mut embedder, 0.3, 5)
 }
 
-/// Recursively import every `*.md` file under `source` (except a
-/// `MEMORY.md` index file, if present) into `bank_id`'s wiki tier,
-/// preserving each file's stem as its slug. Returns the count imported.
+/// Recursively import every `*.md` file under `source` (except `MEMORY.md`) into `bank_id`'s wiki tier. Returns the count imported.
 fn import(
     data_root: &std::path::Path,
     source: &std::path::Path,
@@ -1220,8 +1120,7 @@ fn import(
     Ok(count)
 }
 
-/// Walk `dir` recursively, collecting every `*.md` file except ones
-/// literally named `MEMORY.md` (an index, not a fact to import).
+/// Walk `dir` recursively, collecting every `*.md` file except `MEMORY.md`.
 fn find_md_files(dir: &std::path::Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -1256,10 +1155,7 @@ fn stage(
     handover::stage(&paths, content, reason, source).map_err(|e| e.to_string())
 }
 
-/// The persona payload manifest's required shape (ADR-0009) -- parsed
-/// with plain `serde_json::Value` field access, matching this crate's
-/// existing convention (no `serde` derive dependency, only
-/// `serde_json`).
+/// The persona payload manifest's required shape, parsed via plain `serde_json::Value` access (no `serde` derive dependency).
 struct PersonaManifest {
     slug: String,
     bank: String,
@@ -1312,12 +1208,7 @@ fn parse_persona_manifest(raw: &str) -> Result<PersonaManifest, String> {
     })
 }
 
-/// Stage a persona-build handover from an external caller's manifest
-/// file. `explicit_bank` (the global `--bank` flag) overrides the
-/// manifest's own `bank` field when given -- otherwise the manifest is
-/// self-contained, since an external tool (e.g. `persona`) has no
-/// cwd-based relationship to a bank the way an in-repo `trm` invocation
-/// does.
+/// Stage a persona-build handover from an external caller's manifest file; `explicit_bank` overrides the manifest's own `bank` field.
 fn stage_persona(
     data_root: &std::path::Path,
     explicit_bank: Option<&str>,
@@ -1342,22 +1233,13 @@ fn stage_persona(
     .map_err(|e| e.to_string())
 }
 
-/// What `ingest_session` actually did — `main()`'s match arm reports this
-/// back to the user; a skip is not an error (a disabled hook or a
-/// below-threshold session behaving exactly as configured).
+/// What `ingest_session` actually did; a skip is not an error (a disabled hook or below-threshold session behaving as configured).
 enum IngestOutcome {
     Skipped(String),
     Staged { job_id: String, archived: bool },
 }
 
-/// Full `trm ingest-session` flow, pulled out of `main()`'s match arm so
-/// it's independently testable against real fixtures — same reasoning
-/// `stage`/`pending` already established for this file's other command
-/// bodies. ADR-0006: whole-transcript digest + stage by default
-/// (Phase 1), optionally followed by archiving the source transcript
-/// (`archive_after`, finished sessions only) or scoped to just the delta
-/// since a saved checkpoint (`since_checkpoint`, Phase 2, live sessions
-/// only) — mutually exclusive, enforced both at the CLI layer and here.
+/// Full `trm ingest-session` flow, pulled out of `main()`'s match arm so it's independently testable against real fixtures.
 #[allow(clippy::too_many_arguments)]
 fn ingest_session(
     data_root: &std::path::Path,
@@ -1372,12 +1254,7 @@ fn ingest_session(
         return Err("--archive-after and --since-checkpoint cannot be combined".to_string());
     }
 
-    // Incremental start_line: resolved from a cheap peek (no squishi
-    // subprocess) at the transcript's own sessionId/cwd, so the
-    // checkpoint lookup doesn't need a full digest first. A peek failure
-    // (unreadable/empty file) falls through to start_line 0 -- the
-    // subsequent full digest call surfaces whatever the real problem is,
-    // rather than this function guessing at one.
+    // Cheap peek avoids a squishi subprocess just to find the checkpoint; a peek failure falls through to start_line 0.
     let start_line = if since_checkpoint {
         match ingest::peek_session_meta(transcript_path) {
             Some((session_id, peeked_cwd)) => {
@@ -1394,11 +1271,7 @@ fn ingest_session(
 
     let digest = ingest::run_squishi_session_digest_from(transcript_path, start_line)?;
     if digest.content.trim().is_empty() {
-        // An incremental call landing on "nothing new since the last
-        // checkpoint" is a normal outcome, not a failure -- squishi
-        // itself already treats it this way for start_line > 0 (see
-        // ADR-0006 Phase 2). A genuinely empty whole-file digest is
-        // still worth failing loudly on, unchanged from Phase 1.
+        // "Nothing new since last checkpoint" is a normal outcome, not a failure; a genuinely empty whole-file digest still fails loudly.
         if since_checkpoint {
             return Ok(IngestOutcome::Skipped(
                 "nothing new since last checkpoint".to_string(),
@@ -1407,9 +1280,7 @@ fn ingest_session(
         return Err("nothing to digest (empty session)".to_string());
     }
 
-    // The session's OWN cwd (parsed from squishi's output), not the
-    // invoking process's cwd — same real behavior `stage`'s caller
-    // already preserves for the non-checkpointed path.
+    // The session's OWN cwd (parsed from squishi's output), not the invoking process's.
     let session_cwd = digest
         .cwd
         .as_ref()
@@ -1481,11 +1352,7 @@ fn ingest_session(
     })
 }
 
-/// How long a transcript must sit untouched before `ingest_sessions_all`
-/// will consider archiving it — the secondary guard for when
-/// `$CLAUDE_CODE_SESSION_ID` isn't set (`trm` run outside any live Claude
-/// Code session). Not yet configurable via `trm.json` (see the plan's
-/// Risks section) — a fixed constant until real usage shows it needs to be.
+/// Secondary guard for when `$CLAUDE_CODE_SESSION_ID` isn't set: how long a transcript must sit untouched before archiving considers it.
 const RECENT_MTIME_GUARD_SECS: u64 = 600;
 
 #[derive(Debug, Default, PartialEq)]
@@ -1498,13 +1365,7 @@ struct SweepStats {
     errors: usize,
 }
 
-/// `trm ingest-sessions --all`'s real work: walk every transcript under
-/// `projects_dir`, skip what's clearly not eligible (already archived,
-/// the caller's own live session, too recently modified), and run the
-/// same stage-then-archive path `ingest_session --archive-after` uses for
-/// everything else. One bad file never aborts the sweep — logged to
-/// stderr, counted, moved on — same "not a versioned contract" discipline
-/// every other transcript-reading path in this codebase already follows.
+/// `trm ingest-sessions --all`'s real work; one bad file never aborts the sweep -- logged to stderr, counted, moved on.
 fn ingest_sessions_all(
     data_root: &std::path::Path,
     projects_dir: &std::path::Path,
@@ -1562,8 +1423,7 @@ fn ingest_sessions_all(
             Ok(IngestOutcome::Staged {
                 archived: false, ..
             }) => {
-                // Can't happen with archive_after=true, but not a panic-
-                // worthy invariant break either -- count it and move on.
+                // Can't happen with archive_after=true; not panic-worthy either -- count and move on.
                 stats.errors += 1;
             }
             Ok(IngestOutcome::Skipped(_)) => stats.skipped_below_threshold += 1,
@@ -1577,8 +1437,7 @@ fn ingest_sessions_all(
     stats
 }
 
-/// Resolve the bank and list its open handover jobs. No lock needed —
-/// same as recall, this is a read.
+/// Resolve the bank and list its open handover jobs. No lock needed -- this is a read.
 fn pending(
     data_root: &std::path::Path,
     cwd: &std::path::Path,
@@ -1628,8 +1487,7 @@ fn complete_handover(
     handover::complete(&paths, job_id, result).map_err(|e| e.to_string())
 }
 
-/// Strip a leading `---\n...\n---\n` YAML frontmatter block, if present,
-/// so index summaries reflect the actual content, not frontmatter noise.
+/// Strip a leading YAML frontmatter block, if present, so index summaries reflect actual content.
 fn strip_frontmatter(content: &str) -> &str {
     let Some(rest) = content.strip_prefix("---\n") else {
         return content;
@@ -1640,8 +1498,7 @@ fn strip_frontmatter(content: &str) -> &str {
     }
 }
 
-/// Resolve the bank, acquire its lease lock, write the fact into the wiki
-/// tier, record it in index.md, and release the lock. Returns the slug.
+/// Write the fact into the wiki tier under the bank's lease lock and record it in index.md. Returns the slug.
 fn retain(
     data_root: &std::path::Path,
     cwd: &std::path::Path,

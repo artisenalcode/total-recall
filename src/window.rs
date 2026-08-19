@@ -1,45 +1,11 @@
-//! Split long content into overlapping word-count windows so a fixed-
-//! context embedder can represent all of it, not just the first slice.
-//!
-//! Window size is calibrated against real measurements, not assumed.
-//!
-//! First measurement (`embeddings::tests`, 2026-08-06 probe): cosine
-//! similarity to a needle-matching query went perfectly flat once filler
-//! exceeded 200-250 words past an 11-word needle (~211-261 total words) —
-//! the real hard truncation ceiling, confirming the previously-documented
-//! ~256-token estimate.
-//!
-//! Second measurement (`wiki::tests`, same session): the hard ceiling
-//! isn't the whole story. Even well inside it, a window containing mostly
-//! *topically unrelated* real content (not the first probe's nonsense
-//! filler) dilutes a mean-pooled embedding hard — scores clustered at
-//! ~0.28-0.30 across window sizes from 50 to 180 words against a
-//! deliberately worst-case fixture (a real point buried in 600 words of a
-//! single unrelated topic). Window/overlap tuning alone doesn't fully
-//! solve same-topic dilution; a smaller window reduces it but can't
-//! eliminate it when a real "concept" is a small fraction of any window
-//! that still contains it. This is the concrete, measured case for
-//! ADR-0004's other accepted fix — concept-level chunking *before*
-//! persistence (small, mostly-single-topic stored units) — this windowing
-//! fix is a real mitigation for already-stored large files, not a
-//! substitute for storing atomic concepts in the first place.
-//!
-//! `WINDOW_WORDS` sits well under the measured hard ceiling, small enough
-//! to keep same-topic dilution bounded on real content (which mixes
-//! related sub-topics, not the maximally-adversarial single unrelated
-//! topic the fixture above deliberately tested).
+//! Splits long content into overlapping word-count windows so a fixed-context embedder can represent all of it, not just the first slice.
+//! `WINDOW_WORDS` sits well under the measured ~211-261-word hard truncation ceiling, small enough to keep same-topic dilution bounded.
 pub const WINDOW_WORDS: usize = 80;
 pub const OVERLAP_WORDS: usize = 20;
 
-/// `(char_offset, window_text)` pairs covering `content`. A short document
-/// (at or under `WINDOW_WORDS`) produces exactly one window spanning the
-/// whole thing. Windows overlap by `OVERLAP_WORDS` so a real point that
-/// happens to sit near a window boundary isn't split awkwardly across two
-/// windows with neither containing it in full context.
+/// `(char_offset, window_text)` pairs covering `content`, overlapping by `OVERLAP_WORDS` so a boundary point isn't split across two windows.
 pub fn windows(content: &str, window_words: usize, overlap_words: usize) -> Vec<(usize, String)> {
-    // (word_start_char_offset, word_text) — needed to recover real char
-    // offsets after grouping into windows, since word boundaries aren't
-    // fixed-width.
+    // (word_start_char_offset, word_text), since word boundaries aren't fixed-width.
     let words: Vec<(usize, &str)> = content
         .split_word_bound_indices()
         .filter(|(_, w)| !w.trim().is_empty())
@@ -72,10 +38,7 @@ pub fn windows(content: &str, window_words: usize, overlap_words: usize) -> Vec<
     result
 }
 
-/// Minimal word-boundary splitter (offset, word) — content here is plain
-/// English prose/markdown, not requiring full Unicode segmentation
-/// machinery for a correctness-critical path; whitespace-run boundaries
-/// are sufficient and keep this dependency-free.
+/// Minimal word-boundary splitter -- whitespace runs are sufficient for plain prose/markdown and keep this dependency-free.
 trait WordBoundIndices {
     fn split_word_bound_indices(&self) -> WordBoundIter<'_>;
 }
@@ -141,8 +104,6 @@ mod tests {
         // First window starts at the real beginning.
         assert_eq!(result[0].0, 0);
         assert!(result[0].1.starts_with("w0 "));
-        // Consecutive windows overlap: the tail of one window's word set
-        // should reappear at the head of the next.
         let first_words: Vec<&str> = result[0].1.split_whitespace().collect();
         let second_words: Vec<&str> = result[1].1.split_whitespace().collect();
         assert_eq!(

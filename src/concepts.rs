@@ -1,18 +1,5 @@
-//! Split multi-concept content into atomic-concept sentences, collapsing
-//! near-duplicate paraphrases — the algorithm `advisory/tools/
-//! dedupe_semantic.py` already proved out (sentence-level split, greedy
-//! cosine clustering, threshold 0.8). `squishi/src/semantic_dedup.rs`
-//! already ported this once, on `candle` (see that crate's own
-//! `docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md`).
-//! `total-recall` already has `candle` wired via `embeddings::Embedder`
-//! for the identical reason (it used to depend on `fastembed`, which
-//! forced an `ort` version incompatible with `magika`'s pin in squishi —
-//! both crates are off `ort` entirely now), so this reuses it directly
-//! rather than adding a second embedding stack.
-//!
-//! Per ADR-0004: this is what turns a bulk/ambiguous `stage()` payload
-//! into indexed candidate concepts for a handover's sub-agent to judge
-//! individually, instead of reading one undifferentiated blob.
+//! Splits multi-concept content into atomic-concept sentences, collapsing near-duplicate paraphrases (sentence split + greedy cosine clustering).
+//! Turns a bulk/ambiguous `stage()` payload into indexed candidate concepts for a handover's sub-agent to judge individually.
 
 use crate::embeddings::{Embedder, cosine_similarity};
 use std::collections::HashSet;
@@ -20,12 +7,7 @@ use std::collections::HashSet;
 const MIN_WORDS: usize = 8;
 const MAX_WORDS: usize = 40;
 
-/// Split `text` into qualifying sentences, collapse exact duplicates
-/// (cheap, pre-embedding), then greedily cluster by cosine similarity —
-/// a sentence is dropped once it's `>= threshold` similar to an
-/// already-kept one. Same parameters as `dedupe_semantic.py`'s own
-/// calibration (0.8 = high precision, real-corpus-tuned there; reused
-/// as-is rather than re-calibrated from nothing).
+/// Split `text` into qualifying sentences, collapse exact duplicates, then greedily cluster by cosine similarity (dropped once `>= threshold`).
 pub fn split(text: &str, embedder: &mut Embedder, threshold: f32) -> Result<Vec<String>, String> {
     let candidates = sentences(text);
     if candidates.is_empty() {
@@ -62,11 +44,7 @@ pub fn split(text: &str, embedder: &mut Embedder, threshold: f32) -> Result<Vec<
     Ok(kept_indices.into_iter().map(|i| uniq[i].clone()).collect())
 }
 
-/// Split on sentence-ending punctuation, keep only sentences with a word
-/// count in `MIN_WORDS..=MAX_WORDS` — too short to be a meaningful
-/// standalone concept to judge on its own, or too long to usefully
-/// compare/cluster against others. Same bound as `dedupe_semantic.py`'s
-/// `re.split(r"(?<=[.!?])\s+", ...)` + word-count filter.
+/// Split on sentence-ending punctuation, keeping only sentences within `MIN_WORDS..=MAX_WORDS` -- too short/long to judge as a standalone concept.
 fn sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();

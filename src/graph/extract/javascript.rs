@@ -1,15 +1,6 @@
-//! TypeScript/TSX/JavaScript structural extraction. One extractor for
-//! all three — the TS and JS grammars share the same node/field names
-//! for the shapes this crate cares about (`class_declaration`,
-//! `method_definition`, `function_declaration`, `call_expression`);
-//! TS/TSX additionally produce `interface_declaration` and an
-//! `implements_clause`, which a plain-JS parse simply never emits, so
-//! one recursive walk handles both without a language flag.
-//!
-//! Deterministic AST facts only. Not attempted: arrow-function/const
-//! function expressions (`const f = () => {}`), decorators, or generic
-//! type resolution — an accepted MVP gap, same posture as the Rust
-//! extractor's own documented omissions.
+//! TypeScript/TSX/JavaScript structural extraction. One extractor for all three -- TS/JS grammars share the same node/field names for
+//! the shapes this crate cares about; TS/TSX additionally produce `interface_declaration`/`implements_clause`, which plain JS never emits.
+//! Deterministic AST facts only. Not attempted: arrow-function expressions, decorators, or generic type resolution.
 
 use crate::graph::model::{CodeGraph, EdgeKind, Node, NodeKind};
 use tree_sitter::Node as TsNode;
@@ -112,11 +103,8 @@ pub fn extract_items(
     }
 }
 
-/// Base-class/interface names a `class_declaration`'s heritage refers
-/// to. TS wraps them in `extends_clause`/`implements_clause` nodes; a
-/// plain JS parse only ever produces a bare `extends <identifier>` as
-/// `class_heritage`'s direct child, with no `implements_clause` at all.
-/// Both shapes are handled here so one extractor covers both grammars.
+/// Base-class/interface names a `class_declaration`'s heritage refers to. TS wraps them in `extends_clause`/`implements_clause`; plain
+/// JS produces a bare `extends <identifier>` with no `implements_clause`. Both shapes handled here.
 fn heritage_targets(class_node: TsNode, source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut top_cursor = class_node.walk();
@@ -143,8 +131,7 @@ fn heritage_targets(class_node: TsNode, source: &str) -> Vec<String> {
                     }
                 }
             }
-            // Plain JS: `class_heritage` wraps the superclass identifier
-            // directly, no `extends_clause` wrapper.
+            // Plain JS: no `extends_clause` wrapper.
             "identifier" => out.push(text(&part, source)),
             _ => {}
         }

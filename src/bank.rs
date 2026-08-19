@@ -4,33 +4,22 @@ use std::path::{Path, PathBuf};
 
 const INDEX_TEMPLATE: &str = "# Bank Index\n\n## Pending\n\n(none)\n\n## Entries\n\n";
 
-/// The tiers every bank operation touches — one small, stable surface
-/// per the board's Hashimoto/Cherny guidance, rather than each caller
-/// building its own paths. No `clean` tier: CONTEXT.md's design allowed
-/// for one, but nothing has ever written to it — removed rather than
-/// carried as dead structure (retro action item), to be reintroduced
-/// only once a real ingestion pathway actually needs a clean-tier stage.
+/// The tiers every bank operation touches -- one small, stable surface rather than each caller building its own paths.
 pub struct BankPaths {
     pub root: PathBuf,
     pub wiki: PathBuf,
     pub raw: PathBuf,
     pub index: PathBuf,
     pub pending: PathBuf,
-    /// Archived original session transcripts (ADR-0006) —
-    /// `<session_id>.jsonl.gz`, one per archived session.
+    /// Archived original session transcripts, `<session_id>.jsonl.gz`.
     pub sessions: PathBuf,
-    /// Per-session archival checkpoint (ADR-0006 Phase 1: just an
-    /// `archived` flag per session id — no line-offset tracking yet,
-    /// that's Phase 2's live-compaction concern).
+    /// Per-session archival checkpoint (see `session_checkpoint.rs`).
     pub session_state: PathBuf,
-    /// AST-derived code graph for this bank (`graph.json` + a per-file
-    /// content-hash manifest for incremental `trm graph update`) — see
-    /// `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`.
+    /// AST-derived code graph for this bank (`graph.json` + a per-file content-hash manifest for incremental `trm graph update`).
     pub graph: PathBuf,
 }
 
-/// The data root for all banks. `MF_DATA_ROOT` overrides for tests /
-/// alternate installs; defaults to `~/.trm` per ADR-0001.
+/// The data root for all banks. `MF_DATA_ROOT` overrides for tests/alternate installs; defaults to `~/.trm`.
 pub fn data_root() -> PathBuf {
     if let Ok(over) = std::env::var("MF_DATA_ROOT") {
         return PathBuf::from(over);
@@ -61,13 +50,7 @@ pub fn ensure_index(index_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Upsert a one-line entry for `slug` in index.md's Entries section: if a
-/// line for this slug already exists, replace it in place; otherwise
-/// append. Not a blind append (bug found 2026-08-09 during persona
-/// reingestion: `handover::complete` re-indexing the same slug a second
-/// time -- e.g. after a PersonaBuild synthesis -- produced a stale
-/// duplicate line that had to be hand-removed). Still intentionally
-/// simple line-based matching, not structural markdown parsing.
+/// Upsert a one-line entry for `slug` in index.md's Entries section -- replace in place if a line for this slug exists, else append.
 pub fn append_index_entry(index_path: &Path, slug: &str, summary: &str) -> io::Result<()> {
     ensure_index(index_path)?;
     let contents = std::fs::read_to_string(index_path)?;
@@ -106,13 +89,7 @@ pub fn summarize(content: &str) -> String {
     }
 }
 
-/// Resolve which bank a given invocation should read/write.
-/// Precedence: explicit flag > `.trm-bank` file at the repo root > git
-/// remote (of the enclosing repo) > hash of the enclosing repo's root
-/// path > "global". The `.trm-bank` file exists for the case a remote-
-/// derived or hashed name is wrong — a repo without a remote (or one
-/// whose remote slug doesn't match the bank you actually want) can pin
-/// an explicit, checked-in bank name instead.
+/// Resolve which bank an invocation should use. Precedence: explicit flag > `.trm-bank` file > git remote slug > hash of repo root > "global".
 pub fn resolve_bank_id(explicit: Option<&str>, cwd: &Path) -> String {
     if let Some(explicit) = explicit {
         return explicit.to_string();
@@ -126,8 +103,7 @@ pub fn resolve_bank_id(explicit: Option<&str>, cwd: &Path) -> String {
     }
 }
 
-/// Read a `.trm-bank` file at `repo_root`, if present — its trimmed
-/// contents are the bank id, taking priority over remote/hash derivation.
+/// Read a `.trm-bank` file at `repo_root`, if present -- its trimmed contents are the bank id.
 fn mf_bank_file(repo_root: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(repo_root.join(".trm-bank")).ok()?;
     let trimmed = contents.trim();
@@ -138,11 +114,7 @@ fn mf_bank_file(repo_root: &Path) -> Option<String> {
     }
 }
 
-/// Walk upward from `start` looking for a `.git` directory. `pub(crate)`
-/// so `config.rs` can reuse the exact same repo-root resolution for
-/// `trm.json`'s project-level override — the same repo a session's cwd
-/// belongs to is the same repo whose `.trm-bank` would apply, no reason
-/// for a second, differently-behaved walk-up.
+/// Walk upward from `start` looking for a `.git` directory; `pub(crate)` so `config.rs` can reuse it for `trm.json`'s project override.
 pub(crate) fn find_repo_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
@@ -183,8 +155,7 @@ fn slugify_remote_url(url: &str) -> String {
     tail.into_iter().rev().collect::<Vec<_>>().join("-")
 }
 
-/// Fallback bank id for a repo with no origin remote: a short stable hash
-/// of its absolute path, so the same repo always resolves to the same bank.
+/// Fallback bank id for a repo with no origin remote: a short stable hash of its absolute path.
 fn hash_path_id(repo_root: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -340,11 +311,7 @@ mod tests {
         assert!(contents.contains("`some-slug-abc123` — a one-line summary"));
     }
 
-    /// Bug found 2026-08-09: calling this twice for the same slug (e.g.
-    /// `handover::complete` re-indexing after a PersonaBuild synthesis)
-    /// used to append a second line instead of updating the first,
-    /// producing a stale duplicate that had to be hand-removed. Must
-    /// upsert by slug, not blindly append.
+    /// Calling this twice for the same slug must upsert, not append a duplicate line.
     #[test]
     fn append_index_entry_replaces_the_existing_line_for_the_same_slug_instead_of_duplicating() {
         let tmp = tempfile::tempdir().unwrap();

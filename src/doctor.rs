@@ -1,18 +1,5 @@
-//! Self-diagnostics — checks this tool's own real failure surface (data
-//! root permissions, bank resolution/lazy-creation, lock staleness, model
-//! cache reachability, whether the embedder actually loads) and reports
-//! pass/warn/fail per check, plus an optional `--fix` for the one real
-//! repairable thing in that surface today (a stale lock file).
-//!
-//! Modeled on `agent-browser doctor` (audited 2026-08-07,
-//! docs/ideation/audit-repo-techniques/2026-08-07-enrichment-techniques.md):
-//! one command, read-only checks by default, `--fix` gated separately,
-//! `--json` for scripting, real exit codes.
-//!
-//! Deliberately not a shared framework with squishi's own `--doctor` —
-//! two real implementations as of this plan, not a third need yet (this
-//! project's own "no shared abstraction before a third real need"
-//! convention, already applied twice this session).
+//! Self-diagnostics: data root permissions, bank resolution, lock staleness, model cache reachability, embedder load. Read-only checks by
+//! default, real exit codes, `--json` for scripting, `--fix` gated separately for the one repairable thing (a stale lock file).
 
 use crate::bank;
 use crate::ccr;
@@ -26,8 +13,7 @@ pub enum Status {
     Pass,
     Warn,
     Fail,
-    /// `--quick` skipped an expensive check — distinct from Pass so a
-    /// caller can tell "verified working" from "not actually checked."
+    /// `--quick` skipped an expensive check -- distinct from Pass.
     Skipped,
 }
 
@@ -48,11 +34,7 @@ impl DoctorReport {
         self.checks.iter().any(|c| c.status == Status::Fail)
     }
 
-    /// Hand-rolled, not `serde_json` — this crate has no JSON dependency
-    /// at all today, and a flat list of three string fields per check
-    /// doesn't earn adding one (same reasoning squishi's own
-    /// `build_output` doc comment gives for not reaching for a derive
-    /// macro on a small, controlled output shape).
+    /// Hand-rolled, not `serde_json` -- this crate has no JSON dependency, and three string fields per check doesn't earn adding one.
     pub fn to_json(&self) -> String {
         let checks: Vec<String> = self
             .checks
@@ -97,10 +79,7 @@ fn escape_json(s: &str) -> String {
     out
 }
 
-/// Run every check against `data_root`/`cwd`. Read-only — never mutates
-/// anything (that's `fix`'s job, called separately and explicitly).
-/// `quick` skips the real embedder-load check (the one expensive,
-/// network-capable check in this surface).
+/// Run every check against `data_root`/`cwd`. Read-only -- `fix` is separate and explicit. `quick` skips the expensive embedder-load check.
 pub fn run(data_root: &Path, cwd: &Path, quick: bool) -> DoctorReport {
     let mut checks = Vec::new();
 
@@ -156,9 +135,7 @@ fn check_bank_resolution(bank_id: &str, paths: &bank::BankPaths) -> Check {
             message: format!("cwd resolves to bank {bank_id:?}, already exists"),
         }
     } else {
-        // Not a failure — banks are lazily created on first write (found
-        // for real this session: a bank genuinely didn't exist until
-        // something first wrote to it).
+        // Not a failure -- banks are lazily created on first write.
         Check {
             name,
             status: Status::Warn,
@@ -227,9 +204,7 @@ fn check_model_cache_reachable(models_dir: &Path) -> Check {
     }
     let _ = std::fs::remove_file(&probe);
 
-    // Real signal, no network call: does the cache dir already contain
-    // anything (a prior download), or would loading the embedder for
-    // real need a fresh download?
+    // Real signal, no network call: does the cache dir already contain anything?
     let has_cached_files = std::fs::read_dir(models_dir)
         .map(|mut entries| entries.next().is_some())
         .unwrap_or(false);
@@ -259,9 +234,7 @@ fn check_embedder_loads(models_dir: &Path, quick: bool) -> Check {
             message: "skipped (--quick)".to_string(),
         };
     }
-    // This single real load covers both `recall`'s and `stage()`'s
-    // concept-split viability — report it once, under one label, rather
-    // than loading the model twice under two different check names.
+    // Covers both `recall`'s and `stage()`'s concept-split viability under one label.
     match Embedder::new(models_dir.to_path_buf()) {
         Ok(_) => Check {
             name,
@@ -279,14 +252,7 @@ fn check_embedder_loads(models_dir: &Path, quick: bool) -> Check {
     }
 }
 
-/// Reports CCR store size against `trm.json`'s configured limits (or the
-/// built-in defaults if unset/unreadable). WARN, never FAIL -- an
-/// oversized store is a real "you should run `ccr-gc`" nudge, not a broken
-/// tool, same posture as `check_bank_resolution`'s "not created yet" case.
-/// A malformed `trm.json` is not re-surfaced here -- that's already a hard
-/// error on the command paths that actually read it (`ingest-session`,
-/// `ccr-gc`); this check falls back to defaults rather than duplicating
-/// that failure under a misleading name.
+/// Reports CCR store size against `trm.json`'s configured limits. WARN, never FAIL -- an oversized store is a nudge, not a broken tool.
 fn check_ccr_health(data_root: &Path, cwd: &Path) -> Check {
     let name = "ccr_health".to_string();
     let cfg = config::load(data_root, cwd).unwrap_or_default();
@@ -327,9 +293,7 @@ fn check_ccr_health(data_root: &Path, cwd: &Path) -> Check {
     }
 }
 
-/// The one real repair available in today's failure surface: reclaim a
-/// stale (dead-pid) lock. Returns what it did, or `None` if there was
-/// nothing to fix. Strictly opt-in — `run()` above never calls this.
+/// Reclaim a stale (dead-pid) lock. Returns what it did, or `None`. Strictly opt-in -- `run()` never calls this.
 pub fn fix(paths: &bank::BankPaths) -> Option<String> {
     let lock_path = paths.root.join(".lock");
     if !lock_path.exists() {
@@ -361,7 +325,7 @@ mod tests {
 
     #[test]
     fn data_root_writable_check_fails_on_an_unwritable_path() {
-        // A path under a read-only parent — real permissions, not mocked.
+        // A path under a read-only parent -- real permissions, not mocked.
         let tmp = tempfile::tempdir().unwrap();
         let readonly_parent = tmp.path().join("readonly");
         std::fs::create_dir(&readonly_parent).unwrap();
@@ -519,8 +483,7 @@ mod tests {
         let data_root = tmp.path();
         std::fs::write(data_root.join("trm.json"), "{not valid json").unwrap();
 
-        // Must not panic and must report the (empty) real store state under
-        // the default thresholds, not surface the config parse error here.
+        // Must not panic; reports the real store state under default thresholds, not the config parse error.
         let check = check_ccr_health(data_root, data_root);
         assert_eq!(check.status, Status::Pass);
     }
@@ -546,9 +509,7 @@ mod tests {
         assert!(json.contains(r#""status":"skipped""#));
         assert!(json.contains(r#"\"quoted\""#));
         assert!(json.contains(r"\\with\\backslashes"));
-        // Not a full JSON parser (no serde_json dependency in this
-        // crate), but balanced braces/brackets is a real, cheap
-        // structural sanity check.
+        // Not a full JSON parser, but balanced braces/brackets is a cheap structural sanity check.
         assert_eq!(json.matches('{').count(), json.matches('}').count());
         assert_eq!(json.matches('[').count(), json.matches(']').count());
     }

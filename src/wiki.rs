@@ -35,9 +35,7 @@ pub fn slugify(content: &str) -> String {
     format!("{collapsed}-{:06x}", hasher.finish() & 0xff_ffff)
 }
 
-/// Write `content` into `wiki_dir/<slug>.md`, atomically: write to a
-/// same-directory temp file, then rename over the final path. Returns the
-/// slug used, so the caller can record it in index.md.
+/// Write `content` into `wiki_dir/<slug>.md` atomically. Returns the slug used.
 pub fn write(wiki_dir: &Path, content: &str) -> io::Result<String> {
     let slug = slugify(content);
     let final_path = wiki_dir.join(format!("{slug}.md"));
@@ -45,10 +43,7 @@ pub fn write(wiki_dir: &Path, content: &str) -> io::Result<String> {
     Ok(slug)
 }
 
-/// Write `content` under an exact, caller-chosen slug — no re-hashing.
-/// Used by import pathways that need to preserve an external identity
-/// (e.g. mindforge's existing per-advisor filenames), unlike `write`
-/// which always derives its own slug from content.
+/// Write `content` under an exact, caller-chosen slug -- no re-hashing, unlike `write`.
 pub fn write_named(wiki_dir: &Path, slug: &str, content: &str) -> io::Result<()> {
     let final_path = wiki_dir.join(format!("{slug}.md"));
     atomic::write(&final_path, content)
@@ -84,27 +79,15 @@ pub struct RankedMatch {
     pub slug: String,
     pub score: f32,
     pub snippet: String,
-    /// Char offset into the source file of the window that produced this
-    /// match's score — so a caller can tell *why* a long file matched
-    /// (which part), not just that it did. 0 for a file short enough to
-    /// be a single window (the common case, unchanged from before
-    /// windowing existed).
+    /// Char offset of the window that produced this match's score, so a caller can tell which part of a long file matched. 0 for a single-window file.
     pub window_offset: usize,
 }
 
-/// (offset, end_offset, vector) for one resolved window, and the
-/// per-slug list of them — factored out purely to satisfy
-/// `clippy::type_complexity`, no behavioral meaning beyond that.
+/// Factored out purely to satisfy `clippy::type_complexity`, no behavioral meaning beyond that.
 type ResolvedWindow = (usize, usize, Vec<f32>);
 type ResolvedWindows = Vec<Option<Vec<ResolvedWindow>>>;
 
-/// Semantic recall: rank every entry in `wiki_dir` by cosine similarity
-/// to `query` (local embeddings — same model/mechanism curator-scan
-/// already uses, reused rather than rebuilt). Replaces an earlier
-/// grep-based `search` entirely — retro finding was "no ranking," and
-/// keeping both a grep path and a ranked path around would just be the
-/// same dead-code problem the `clean` tier was. Returns matches scoring
-/// at or above `min_score`, highest first, capped to `limit`.
+/// Semantic recall: rank every entry in `wiki_dir` by cosine similarity to `query`, returning matches at or above `min_score`, highest first.
 pub fn semantic_search(
     wiki_dir: &Path,
     query: &str,
@@ -117,17 +100,11 @@ pub fn semantic_search(
         return Ok(Vec::new());
     }
 
-    // Per-slug resolved windows: (offset, end_offset, vector), either
-    // reused from a still-valid cache entry or freshly embedded below.
-    // `None` placeholders get filled in once the batch embed call
-    // returns; keeping content alongside so a cache miss's window text
-    // can be sliced out for `snippet_of` without re-reading the file.
+    // Per-slug resolved windows, reused from cache or freshly embedded below; `None` is filled in once the batch embed call returns.
     let mut contents: Vec<String> = Vec::with_capacity(slugs.len());
     let mut resolved: ResolvedWindows = Vec::with_capacity(slugs.len());
 
-    // Batch-embed only what's actually dirty (missing or stale cache) —
-    // the whole point of this cache: an unchanged bank costs one query
-    // embed and zero file re-embeds, not a full re-embed every call.
+    // Batch-embed only what's dirty (missing or stale cache) -- an unchanged bank costs one query embed and zero file re-embeds.
     let mut texts = vec![query.to_string()];
     let mut dirty_slug_idx = Vec::new();
     let mut dirty_window_span = Vec::new(); // (offset, end_offset) per queued text
@@ -192,8 +169,7 @@ pub fn semantic_search(
             }
         }
 
-        // The query itself only needs embedding when something was
-        // actually dirty — an unchanged bank never calls `embed` at all.
+        // The query only needs embedding when something was actually dirty.
         let query_vec = vectors[0].clone();
         return rank(slugs, contents, resolved, &query_vec, min_score, limit);
     }
@@ -389,9 +365,7 @@ mod tests {
         let cache_path = tmp.path().join(".embeddings/fact.cache");
         let mtime_after_first = fs::metadata(&cache_path).unwrap().modified().unwrap();
 
-        // A second call against unchanged content must not rewrite the
-        // cache file — proof the entry wasn't re-embedded, not just that
-        // results still look right.
+        // A second call against unchanged content must not rewrite the cache file -- proof the entry wasn't re-embedded.
         std::thread::sleep(std::time::Duration::from_millis(10));
         semantic_search(tmp.path(), "different query entirely", &mut e, 0.0, 10).unwrap();
         let mtime_after_second = fs::metadata(&cache_path).unwrap().modified().unwrap();
@@ -468,22 +442,8 @@ mod tests {
         assert!(snippet.chars().count() <= 121);
     }
 
-    /// The real regression this whole fix exists for: a distinctive phrase
-    /// sitting past the old whole-file-embedding truncation point (>300
-    /// words of unrelated filler before it — comfortably past the ~211-261
-    /// word real ceiling measured in embeddings.rs's probe) must still be
-    /// found. Before windowing, this returns empty — the file's embedding
-    /// never saw the phrase at all.
-    ///
-    /// min_score here is 0.25, not the library-wide 0.3 recall default —
-    /// measured (window.rs's module doc), not guessed: this fixture is
-    /// deliberately worst-case (a real point diluted by 600 words of a
-    /// single unrelated topic, not realistic mixed-topic content), and
-    /// real scores against it cluster at 0.28-0.30 regardless of window
-    /// size. The fix under test is "0 matches -> a real, findable match,"
-    /// not "always clears an arbitrary universal floor on adversarial
-    /// content" — real session/doc content mixing related sub-topics
-    /// should score better than this intentionally-hard fixture.
+    /// A phrase past the old whole-file truncation point (>300 words of filler) must still be found; before windowing this returned empty.
+    /// min_score is 0.25, not the library-wide 0.3 default -- this fixture is deliberately worst-case and real scores cluster at 0.28-0.30.
     #[test]
     fn semantic_search_finds_a_match_buried_past_the_old_truncation_point() {
         let tmp = tempfile::tempdir().unwrap();

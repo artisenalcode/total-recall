@@ -1,12 +1,5 @@
-//! Python structural extraction. Deterministic AST facts only.
-//!
-//! A class's base classes (`class Dog(Animal):`) are emitted as pending
-//! `Implements`-style edges, resolved against any node — `Struct` or
-//! `Trait` — matching that name, since Python has no separate
-//! interface/trait kind to disambiguate against (unlike Rust). Not
-//! attempted: decorators, `self`-attribute call targets beyond a plain
-//! `self.method()`, multiple inheritance beyond the first base's edge —
-//! every base still gets its own pending edge, just no MRO reasoning.
+//! Python structural extraction. Deterministic AST facts only. Base classes are emitted as pending `Implements`-style edges, resolved
+//! against any `Struct`/`Trait`-kind node matching that name (Python has no separate interface kind). Not attempted: decorators, MRO.
 
 use crate::graph::model::{CodeGraph, EdgeKind, Node, NodeKind};
 use tree_sitter::Node as TsNode;
@@ -19,9 +12,7 @@ fn text(node: &TsNode, source: &str) -> String {
     source[node.byte_range()].to_string()
 }
 
-/// `current_class` scopes a nested `function_definition`'s id under its
-/// enclosing class, same convention as the Rust extractor's
-/// `current_impl_type`.
+/// `current_class` scopes a nested `function_definition`'s id under its enclosing class, matching the Rust extractor's `current_impl_type`.
 pub fn extract_items(
     node: TsNode,
     source: &str,

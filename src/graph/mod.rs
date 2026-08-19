@@ -1,10 +1,5 @@
-//! No-LLM, AST-derived code graph for Rust, TypeScript/TSX, JavaScript,
-//! Go, and Python sources
-//! (`docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`).
-//! `model` holds the graph type and its `graph.json` (de)serialization;
-//! `extract` builds one from a directory via tree-sitter. Query verbs
-//! (`query`/`path`/`god-nodes`) land in a follow-up pass — see the plan
-//! doc's remaining Steps.
+//! No-LLM, AST-derived code graph for Rust, TypeScript/TSX, JavaScript, Go, and Python. `model` holds the graph type and its
+//! `graph.json` (de)serialization; `extract` builds one from a directory via tree-sitter.
 
 pub mod extract;
 pub mod manifest;
@@ -14,22 +9,17 @@ pub mod query;
 use crate::bank::BankPaths;
 use std::path::PathBuf;
 
-/// Where a bank's `graph.json` lives — `paths.graph` is a directory tier
-/// (parallel to `wiki`/`raw`/`sessions`), this is the one file in it.
+/// Where a bank's `graph.json` lives -- the one file in the `graph` tier.
 pub fn graph_file_path(paths: &BankPaths) -> PathBuf {
     paths.graph.join("graph.json")
 }
 
-/// Where a bank's incremental-`update` content-hash manifest lives —
-/// alongside `graph.json` in the same tier, see `graph::manifest`.
+/// Where a bank's incremental-`update` content-hash manifest lives, alongside `graph.json`.
 pub fn manifest_file_path(paths: &BankPaths) -> PathBuf {
     paths.graph.join("manifest.json")
 }
 
-/// Rank nodes by total degree (in + out), highest first — graphify's own
-/// "god nodes" concept: the nodes with the most fan-in/fan-out, a cheap
-/// refactor-risk signal. Pure graph algorithm, no extraction or embedding
-/// involved.
+/// Rank nodes by total degree (in + out), highest first -- the nodes with the most fan-in/fan-out, a cheap refactor-risk signal.
 pub fn god_nodes(graph: &model::CodeGraph, n: usize) -> Vec<(String, usize)> {
     use petgraph::Direction;
     let mut ranked: Vec<(String, usize)> = graph
@@ -46,12 +36,7 @@ pub fn god_nodes(graph: &model::CodeGraph, n: usize) -> Vec<(String, usize)> {
     ranked
 }
 
-/// Shortest path between two node ids — unweighted BFS following edge
-/// direction (no edge weights exist in this graph yet, and traversing
-/// `Calls`/`Contains`/`Implements` forward is the meaningful direction for
-/// "how does A reach B"). Returns the full id sequence including both
-/// endpoints, or `None` if either id is unknown or no directed path
-/// exists between them.
+/// Shortest path between two node ids -- unweighted BFS following edge direction. Returns the full id sequence, or `None` if unreachable.
 pub fn shortest_path(graph: &model::CodeGraph, from: &str, to: &str) -> Option<Vec<String>> {
     use petgraph::visit::EdgeRef;
     use std::collections::{HashMap, HashSet, VecDeque};

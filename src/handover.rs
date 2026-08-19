@@ -3,75 +3,34 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-/// Below this, `stage()` doesn't bother pre-splitting into candidate
-/// concepts — matches squishi's own "skip compression under N chars"
-/// pattern (same number, same reasoning: nothing meaningful to gain on
-/// content this small).
+/// Below this, `stage()` doesn't bother pre-splitting — matches squishi's own "skip compression under N chars" threshold.
 const CONCEPT_SPLIT_MIN_CHARS: usize = 2000;
 const CONCEPT_SPLIT_THRESHOLD: f32 = 0.8;
 
-/// The kind of judgment call being handed back to the calling harness.
-/// Per ADR-0002: trm never calls an LLM itself; it only describes what
-/// needs deciding.
+/// The kind of judgment call being handed back to the calling harness; trm never calls an LLM itself.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HandoverKind {
     /// Raw ingested content needs fact extraction into the clean tier.
     Extraction,
     /// Two or more wiki entries look related; judge whether to merge/retire.
     Curation,
-    /// Raw source transcripts for a person need synthesizing into one
-    /// persona wiki page. Deliberately NOT concept-split — per-sentence
-    /// splitting is the wrong shape for this job (it's exactly the
-    /// candidate-explosion problem measured 2026-08-07: one real
-    /// transcript produced 421 sentence-level candidates). A persona
-    /// build needs the whole source read together for one holistic
-    /// authoring task, not judged sentence-by-sentence.
+    /// Deliberately NOT concept-split — per-sentence splitting produced 421 candidates from one real transcript; needs whole-source authoring.
     PersonaBuild,
 }
 
-/// A single unit of work trm cannot do itself. Milestone 1 defines the
-/// shape only — nothing constructs one yet, since direct retain never
-/// needs a handover. Milestone 2's ingestion pathways and the curator
-/// pass are the first real producers of these.
+/// A single unit of work trm cannot do itself; trm never calls an LLM.
 #[derive(Debug, PartialEq, Eq)]
 pub struct HandoverTask {
     pub kind: HandoverKind,
     pub description: String,
     pub sources: Vec<PathBuf>,
-    /// Where the sources came from: "direct" (user/agent-authored, trusted),
-    /// "internal" (curator comparing already-stored wiki content, trusted),
-    /// or anything else — an ingestion pathway like "web-scrape", which is
-    /// untrusted external content and gets flagged in the rendered prompt.
-    /// Per the board's IppSec catch: a sub-agent reading staged content as
-    /// part of a handover must be able to tell trusted from untrusted input,
-    /// the same way a prompt should never blur data and instructions.
+    /// "direct"/"internal" are trusted; anything else (e.g. "web-scrape") is flagged untrusted in the rendered prompt.
     pub source: String,
-    /// Deterministic concept-split candidates (empty for small content, or
-    /// when splitting wasn't available — see `stage()`). Per ADR-0004: lets
-    /// the judging sub-agent work through indexed candidates instead of one
-    /// undifferentiated blob — each real one gets `retain`ed on its own,
-    /// this handover just needs `complete-handover` to close the audit
-    /// trail once judgment is done.
+    /// Deterministic concept-split candidates, empty for small content or when splitting wasn't available (see `stage()`).
     pub candidate_concepts: Vec<String>,
-    /// Set when concept-splitting was attempted (content was large enough)
-    /// but failed (model unavailable, offline, corrupted cache) — distinct
-    /// from `candidate_concepts` simply being empty because content was
-    /// small. Found in review (2026-08-07): the original fallback was
-    /// silent, indistinguishable from "nothing to split," which let a
-    /// sub-agent unknowingly `complete-handover` a whole raw blob as one
-    /// result and reproduce the exact bug this mechanism exists to
-    /// prevent. Rendered as an explicit note in `as_prompt()` so the
-    /// sub-agent knows it's judging an unsplit blob on purpose, not by
-    /// silent degradation.
+    /// Set when concept-splitting was attempted but failed, distinct from `candidate_concepts` being empty because content was small.
     pub split_failure: Option<String>,
-    /// `PersonaBuild` only (ADR-0007): true when the persona being built
-    /// is the user's OWN self-persona from their real session
-    /// transcripts, not a third-party advisor from public-record
-    /// sources. Swaps `PERSONA_BUILD_CRITERIA` for
-    /// `SELF_PERSONA_BUILD_CRITERIA` in `as_prompt()` — criterion #3's
-    /// "personally-supplied relational layer ONLY if the requester
-    /// actually knows this person" framing is backwards when the subject
-    /// IS the requester.
+    /// `PersonaBuild` only: true for the user's own self-persona, swapping in `SELF_PERSONA_BUILD_CRITERIA` instead of the advisor framing.
     pub self_build: bool,
 }
 
@@ -93,24 +52,19 @@ impl HandoverTask {
         }
     }
 
-    /// Attach pre-split candidate concepts — a separate builder step
-    /// rather than a `new()` parameter, so every existing call site
-    /// (curator, tests) that doesn't need this is untouched.
+    /// Separate builder step rather than a `new()` parameter, so existing call sites that don't need this are untouched.
     pub fn with_candidate_concepts(mut self, candidates: Vec<String>) -> Self {
         self.candidate_concepts = candidates;
         self
     }
 
-    /// Record that concept-splitting was attempted and failed — see
-    /// `split_failure`'s doc comment for why this is distinct from
-    /// simply not calling `with_candidate_concepts` at all.
+    /// Record that concept-splitting was attempted and failed — see `split_failure`'s doc comment.
     pub fn with_split_failure(mut self, reason: impl Into<String>) -> Self {
         self.split_failure = Some(reason.into());
         self
     }
 
-    /// Mark this `PersonaBuild` as the user's own self-persona — see
-    /// `self_build`'s doc comment.
+    /// Mark this `PersonaBuild` as the user's own self-persona — see `self_build`'s doc comment.
     pub fn with_self_persona_build(mut self) -> Self {
         self.self_build = true;
         self
@@ -120,8 +74,7 @@ impl HandoverTask {
         self.source == "direct" || self.source == "internal"
     }
 
-    /// Render as the prompt payload for a sub-agent spawn (Cherny's framing:
-    /// the handover *is* a sub-agent invocation, not a bespoke RPC).
+    /// Render as the prompt payload for a sub-agent spawn — the handover *is* a sub-agent invocation, not a bespoke RPC.
     pub fn as_prompt(&self) -> String {
         let warning = if self.is_trusted() {
             String::new()
@@ -181,19 +134,7 @@ impl HandoverTask {
     }
 }
 
-/// The real capture criteria co-developed with Dr. Roy Sugarman
-/// (2026-08-07, see advisory/knowledge/wiki/roy-sugarman.md and the
-/// jordan-peterson.md file built with them) — embedded here so a
-/// sub-agent picking up a PersonaBuild handover has the actual
-/// instructions in hand, not a pointer to go re-derive them.
-///
-/// Output shape updated 2026-08-08 (advisory/knowledge/README.md's
-/// "Indexed persona" pattern): Peterson and Sugarman were both built as
-/// one flat wiki page first, then split into an index + section files
-/// in two follow-up passes once the flat file's always-loaded cost
-/// became visible in practice. Write straight into the indexed shape
-/// from here on — there's no reason to ship the flat intermediate now
-/// that the target shape is known.
+/// Embedded so a sub-agent picking up a PersonaBuild handover has the actual capture criteria in hand, not a pointer to re-derive them.
 const PERSONA_BUILD_CRITERIA: &str = "\n\n\
 PERSONA BUILD — synthesize the source transcripts above into an INDEXED persona wiki: an \
 index file plus one file per section (see Output format below), not one flat page. Read all \
@@ -240,14 +181,7 @@ index/guardrail split is the part that matters, not the file count.\n\n\
 When done: write all of the above to the resolved bank's wiki tier, then `trm complete-handover \
 <job-id> \"<summary>\"`.";
 
-/// Same criteria and output shape as `PERSONA_BUILD_CRITERIA`, with one
-/// real difference (ADR-0007): this is the user's OWN self-persona, built
-/// from their real Claude Code session transcripts — not a third-party
-/// advisor being observed from public-record sources. Criterion #3's
-/// "personally-supplied relational layer ONLY if the requester actually
-/// knows this person" framing is backwards here — the subject IS the
-/// requester, so there's no relational layer to a third party to
-/// (not-)fabricate; the whole corpus is already first-person.
+/// Same as `PERSONA_BUILD_CRITERIA`, but for the user's own self-persona — criterion #3's third-party framing is backwards when subject IS requester.
 const SELF_PERSONA_BUILD_CRITERIA: &str = "\n\n\
 PERSONA BUILD (SELF) — synthesize the source session transcripts above into an INDEXED \
 persona wiki for the USER'S OWN self-persona: an index file plus one file per section (see \
@@ -295,23 +229,7 @@ index/guardrail split is the part that matters, not the file count.\n\n\
 When done: write all of the above to the resolved bank's wiki tier, then `trm complete-handover \
 <job-id> \"<summary>\"`.";
 
-/// Stage raw content for extraction: write it into the raw tier, then
-/// drop a pending marker (the rendered prompt) so `list_pending` and a
-/// future harness session can find it. `source` labels provenance —
-/// "direct" for user/agent-authored content, anything else (e.g.
-/// "web-scrape") is treated as untrusted and flagged in the prompt.
-///
-/// Per ADR-0004: content over `CONCEPT_SPLIT_MIN_CHARS` gets deterministically
-/// pre-split into candidate concepts (`concepts::split`) before the prompt is
-/// rendered, so the judging sub-agent works through indexed candidates
-/// instead of one undifferentiated blob. Splitting is best-effort — if the
-/// embedding model isn't available (offline, first-run download failed),
-/// `stage` falls back to today's whole-content behavior rather than failing
-/// the stage outright; same resilience posture as squishi's
-/// `semantic_dedup` falling back to line-dedup when its model is
-/// unavailable.
-///
-/// Returns the job id (== slug).
+/// Writes content to the raw tier and drops a pending marker (the rendered prompt); content over `CONCEPT_SPLIT_MIN_CHARS` gets pre-split first. Returns the job id (== slug).
 pub fn stage(
     paths: &bank::BankPaths,
     content: &str,
@@ -326,11 +244,7 @@ pub fn stage(
     if content.len() > CONCEPT_SPLIT_MIN_CHARS {
         task = match split_into_candidates(content) {
             Ok(candidates) => task.with_candidate_concepts(candidates),
-            // Attempted and failed — recorded, not swallowed (review
-            // finding 2026-08-07: a silent fallback here was
-            // indistinguishable from "nothing to split," letting a
-            // sub-agent unknowingly complete-handover a whole raw blob
-            // and reproduce the exact bug this mechanism prevents).
+            // Recorded, not swallowed -- see split_failure's doc comment.
             Err(e) => task.with_split_failure(e),
         };
     }
@@ -338,12 +252,7 @@ pub fn stage(
     Ok(slug)
 }
 
-/// Stage a set of already-written raw source transcripts as one
-/// `PersonaBuild` handover — deliberately never concept-split (see
-/// `HandoverKind::PersonaBuild`'s doc comment for why). The job id is
-/// derived from `slug` directly, not `wiki::slugify`'d from content,
-/// since there's no single content blob here — the caller (persona
-/// ingestion) already knows the person's slug.
+/// Stages raw source transcripts as one `PersonaBuild` handover, never concept-split; job id is the caller-supplied `slug` directly.
 pub fn stage_persona_sources(
     paths: &bank::BankPaths,
     slug: &str,
@@ -365,22 +274,14 @@ pub fn stage_persona_sources(
     Ok(slug.to_string())
 }
 
-/// Isolated so a model-load/split failure is a plain `Err(reason)` the
-/// caller records on the task, rather than silently swallowed — same
-/// resilience *intent* as squishi's semantic-dedup fallback, but visible
-/// this time (see `HandoverTask::split_failure`'s doc comment for why
-/// squishi's own silent-fallback-to-a-simpler-pass shape doesn't fully
-/// apply here: there, the fallback result is still real, useful,
-/// judged-nothing output; here, "fall back to the raw blob" is exactly
-/// the shape of the original bug if nobody's told it happened).
+/// Isolated so a model-load/split failure is a plain `Err(reason)` recorded on the task, never silently swallowed.
 fn split_into_candidates(content: &str) -> Result<Vec<String>, String> {
     let mut embedder = embeddings::Embedder::new(bank::data_root().join("models"))
         .map_err(|e| format!("embedding model unavailable: {e}"))?;
     concepts::split(content, &mut embedder, CONCEPT_SPLIT_THRESHOLD)
 }
 
-/// List open handover job ids in a bank (empty if none, or the bank has
-/// never staged anything — no pending/ dir yet).
+/// List open handover job ids in a bank (empty if the bank has never staged anything).
 pub fn list_pending(paths: &bank::BankPaths) -> io::Result<Vec<String>> {
     if !paths.pending.exists() {
         return Ok(Vec::new());
@@ -397,11 +298,7 @@ pub fn list_pending(paths: &bank::BankPaths) -> io::Result<Vec<String>> {
     Ok(ids)
 }
 
-/// List every pending job across every bank under `data_root` — `(bank_id,
-/// job_id)` pairs, sorted. Needed for the shared handover-completion
-/// workflow (board: Cherny) to be multi-bank aware, since not every
-/// pathway resolves its bank from cwd the same way (code archaeology
-/// resolves from the target repo path, not the invoking directory).
+/// List every pending job across every bank under `data_root` as sorted `(bank_id, job_id)` pairs.
 pub fn list_pending_all_banks(data_root: &std::path::Path) -> io::Result<Vec<(String, String)>> {
     let banks_dir = data_root.join("banks");
     if !banks_dir.exists() {
@@ -423,32 +320,14 @@ pub fn list_pending_all_banks(data_root: &std::path::Path) -> io::Result<Vec<(St
     Ok(all)
 }
 
-/// Read a pending job's exact rendered prompt — what a sub-agent should
-/// receive verbatim. Previously only reachable by a caller knowing the
-/// internal `pending/<job-id>.md` path directly; this is the documented
-/// way to get it.
+/// Read a pending job's exact rendered prompt — what a sub-agent should receive verbatim.
 pub fn get_prompt(paths: &bank::BankPaths, job_id: &str) -> io::Result<String> {
     fs::read_to_string(paths.pending.join(format!("{job_id}.md")))
 }
 
-/// Commit a completed handover: the harness already did the judgment
-/// work (extraction, curation) and hands back `result`. Writes it into
-/// the wiki tier under the job id, records it in index.md, and clears
-/// the pending marker. The raw source stays in the raw tier — not
-/// deleted, kept for audit.
+/// Commit a completed handover: writes `result` into the wiki tier, records it in index.md, and clears the pending marker.
 pub fn complete(paths: &bank::BankPaths, job_id: &str, result: &str) -> io::Result<()> {
-    // Bug found 2026-08-09: some handover kinds (PersonaBuild) use
-    // job_id as the deliverable's own wiki slug, and the completing
-    // agent writes the real multi-file content directly to
-    // `wiki/<job_id>.md` (+ section files) *before* calling
-    // complete-handover -- that's the documented output-format contract
-    // for that kind. Overwriting it here with `result` (just a one-line
-    // completion summary) destroyed real content. If a wiki file for
-    // this job_id already exists, treat that as evidence the deliverable
-    // was already written directly: index off its actual content
-    // instead of clobbering it with the summary string. Only fall back
-    // to writing `result` as the wiki file when nothing exists yet --
-    // the normal Extraction/Curation case, unaffected by this fix.
+    // A pre-existing wiki file (PersonaBuild writes its own directly) is indexed as-is, never overwritten with `result`.
     let wiki_path = paths.wiki.join(format!("{job_id}.md"));
     let summary = if wiki_path.exists() {
         let existing = fs::read_to_string(&wiki_path)?;
@@ -485,12 +364,7 @@ mod tests {
         assert!(prompt.contains("raw/b.md"));
     }
 
-    /// Review finding fix (2026-08-07): a split failure must render as an
-    /// explicit, visible note distinct from "nothing to split" — this is
-    /// the rendering-logic test; the actual model-load failure path
-    /// (`split_into_candidates`) isn't cheaply forceable in a fast unit
-    /// test, so this exercises the deterministic contract directly via
-    /// `with_split_failure` rather than needing a real broken model cache.
+    /// Exercises the rendering contract via `with_split_failure` rather than forcing a real model-load failure.
     #[test]
     fn as_prompt_notes_a_split_failure_distinctly_from_no_candidates() {
         let with_failure = HandoverTask::new(HandoverKind::Extraction, "reason", vec![], "direct")
@@ -541,15 +415,7 @@ mod tests {
         (data_root, paths)
     }
 
-    /// Bug found 2026-08-09 during persona reingestion: `job_id` for a
-    /// PersonaBuild handover is the persona's own slug (e.g.
-    /// "andrej-karpathy"), and the completing agent writes the real
-    /// multi-file wiki deliverable directly to `wiki/<slug>.md` (+
-    /// section files) *before* calling complete-handover -- per
-    /// PersonaBuild's own output-format contract. `complete()` must not
-    /// then blindly overwrite that file with the one-line `result`
-    /// summary string; it clobbered a carefully-written index page with
-    /// "Built full indexed persona wiki..." and had to be hand-restored.
+    /// `complete()` must not overwrite a wiki file a PersonaBuild agent already wrote directly.
     #[test]
     fn complete_does_not_clobber_a_wiki_file_the_agent_already_wrote_for_this_job_id() {
         let (_data_root, paths) = test_paths();
@@ -571,9 +437,7 @@ mod tests {
         );
     }
 
-    /// The normal case (no pre-existing wiki file for this job_id, e.g.
-    /// Extraction/Curation kinds) is unaffected: `result` is still what
-    /// gets written and indexed.
+    /// Normal case (no pre-existing wiki file): `result` is still what gets written and indexed.
     #[test]
     fn complete_still_writes_result_as_the_wiki_file_when_none_exists_yet() {
         let (_data_root, paths) = test_paths();
@@ -583,8 +447,7 @@ mod tests {
         assert_eq!(on_disk, "the extracted fact");
     }
 
-    /// Either way, the pending marker is still cleared -- the clobbering
-    /// bug only affected wiki content, not job completion itself.
+    /// Pending marker is cleared either way -- the clobbering bug only affected wiki content, not completion itself.
     #[test]
     fn complete_removes_the_pending_marker_whether_or_not_a_wiki_file_pre_existed() {
         let (_data_root, paths) = test_paths();
@@ -641,18 +504,13 @@ mod tests {
         assert!(marker.contains("yt-def456.md"));
         // Never concept-split -- the whole point of this job kind.
         assert!(!marker.contains("candidate concept(s)"));
-        // The real, embedded criteria (co-developed with Roy) must be
-        // present so a sub-agent has the actual instructions, not a
-        // pointer to go re-derive them.
         assert!(marker.contains("Values, ranked, evidenced by what they return to unprompted"));
         assert!(marker.contains("externally disputed"));
-        // Not the self-build variant -- ADR-0007's framing must not leak
-        // into a normal advisor build.
+        // Not the self-build variant.
         assert!(!marker.contains("PERSONA BUILD (SELF)"));
     }
 
-    /// ADR-0007: a self-persona build renders the self-framed criteria
-    /// instead of the third-party-advisor framing, and never the reverse.
+    /// A self-persona build renders the self-framed criteria, never the third-party-advisor framing.
     #[test]
     fn stage_persona_sources_self_build_renders_the_self_framed_criteria() {
         let (_data_root, paths) = test_paths();
@@ -676,11 +534,7 @@ mod tests {
         ));
     }
 
-    /// Per ADR-0004: bulk/multi-concept content staged for a handover
-    /// should get pre-split into indexed candidate concepts, so the
-    /// judging sub-agent isn't handed one undifferentiated blob. Small
-    /// content (below the concepts::split threshold) is unaffected —
-    /// this test proves the large-content path specifically.
+    /// Bulk/multi-concept content gets pre-split into indexed candidate concepts; small content (unaffected) is proven separately.
     #[test]
     fn stage_with_large_multi_concept_content_lists_indexed_candidates() {
         let (_data_root, paths) = test_paths();

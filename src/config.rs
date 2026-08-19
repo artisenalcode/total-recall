@@ -1,22 +1,5 @@
-//! `trm.json` — user-configurable behavior for automated session staging
-//! (ADR-0006). Two locations, merged field-by-field: a global file at
-//! `<data_root>/trm.json`, and an optional project override at
-//! `<repo_root>/.trm/trm.json` (same relative shape as the existing
-//! `.trm-bank` file precedent) for the repo enclosing `cwd`, if any.
-//! Missing files are not errors — defaults apply, and those defaults
-//! reproduce today's unconditional-staging behavior exactly (both hooks
-//! enabled, no thresholds, keep archives forever) so `trm.json` existing
-//! at all never changes behavior for someone who hasn't written one.
-//! Malformed JSON on a file that *does* exist is a hard error, surfaced
-//! to the caller: a typo'd config silently ignored is worse than a loud
-//! failure here, since nothing in this module touches transcript
-//! content — it only gates behavior elsewhere.
-//!
-//! Hand-parsed against `serde_json::Value` rather than a
-//! `#[derive(Deserialize)]` struct — matches every other JSON-parsing
-//! boundary in this crate (`ingest::parse_squishi_json`, squishi's own
-//! `build_output`), and avoids pulling in `serde`'s derive feature for a
-//! small, stable schema.
+//! `trm.json` -- user-configurable behavior for automated session staging, merged field-by-field from a global file and an optional project override.
+//! Missing files fall back to defaults that reproduce today's unconditional-staging behavior; malformed JSON on an existing file is a hard error.
 
 use crate::bank::find_repo_root;
 use serde_json::Value;
@@ -24,10 +7,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrmConfig {
-    /// Overrides `bank::data_root()`'s own `~/.trm` default — but
-    /// `MF_DATA_ROOT` (the existing env var, used throughout the test
-    /// suite for isolation) still wins over this field wherever both are
-    /// consulted; this field only fills in when the env var is unset.
+    /// Overrides `bank::data_root()`'s `~/.trm` default; `MF_DATA_ROOT` still wins over this wherever both are consulted.
     pub data_root: Option<String>,
     pub pre_compact_enabled: bool,
     pub session_end_enabled: bool,
@@ -35,13 +15,9 @@ pub struct TrmConfig {
     pub min_bytes: usize,
     /// `None` == keep archived transcripts forever.
     pub retention_days: Option<u64>,
-    /// `ccr-gc`'s default age cutoff, in days -- an entry whose `last_seen`
-    /// is older than this is evicted. 3 days is generous enough to survive
-    /// a slow-moving multi-day task without accumulating forever.
+    /// `ccr-gc`'s default age cutoff in days.
     pub ccr_max_age_days: u64,
-    /// `ccr-gc`'s default total-size cap across the whole CCR store, in
-    /// bytes -- bounds unbounded growth even before the age cutoff would
-    /// otherwise kick in on a very active machine.
+    /// `ccr-gc`'s default total-size cap across the CCR store, in bytes.
     pub ccr_max_bytes: u64,
 }
 
@@ -60,11 +36,7 @@ impl Default for TrmConfig {
     }
 }
 
-/// Resolve `TrmConfig` for a given `data_root`/`cwd`: start from defaults,
-/// merge the global file if present, then merge the project override (the
-/// repo enclosing `cwd`, if any) on top — later merges win per-field, not
-/// per-file, so a project file that only sets one key doesn't reset the
-/// rest to default.
+/// Resolve `TrmConfig`: defaults, then the global file, then the project override, merging per-field so one key doesn't reset the rest.
 pub fn load(data_root: &Path, cwd: &Path) -> Result<TrmConfig, String> {
     let mut config = TrmConfig::default();
 
@@ -81,8 +53,7 @@ pub fn load(data_root: &Path, cwd: &Path) -> Result<TrmConfig, String> {
     Ok(config)
 }
 
-/// `Ok(None)` if the file doesn't exist — not an error. `Err` only for a
-/// file that exists but isn't valid JSON.
+/// `Ok(None)` if the file doesn't exist; `Err` only for a file that exists but isn't valid JSON.
 fn read_json_file(path: &Path) -> Result<Option<Value>, String> {
     let contents = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -94,9 +65,7 @@ fn read_json_file(path: &Path) -> Result<Option<Value>, String> {
         .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))
 }
 
-/// Overwrite only the fields actually present in `value`, leaving
-/// everything else in `config` untouched — the "field-level, not
-/// file-level" merge semantics `load`'s doc comment promises.
+/// Overwrite only the fields actually present in `value`, leaving everything else in `config` untouched.
 fn merge(config: &mut TrmConfig, value: &Value) {
     if let Some(s) = value.get("data_root").and_then(|v| v.as_str()) {
         config.data_root = Some(s.to_string());

@@ -1,18 +1,6 @@
-//! tree-sitter-based structural extraction, multi-language (Rust, TS/
-//! TSX/JS, Go, Python). Originally Rust-only (Step 4 of
-//! `docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md`);
-//! generalized 2026-08-19 by moving each language's grammar-specific
-//! walk into its own submodule (`rust`, `javascript`, `go`, `python`)
-//! behind one `Language` dispatch, keeping this file's public API
-//! (`extract_dir`/`update_dir`/`manifest_for`/`UpdateSummary`) unchanged
-//! for every existing caller.
-//!
-//! Deterministic AST facts only, same posture in every language: no
-//! macro/generic expansion, no cross-file type resolution. `Calls` and
-//! `Implements` edges are resolved by matching an identifier's short
-//! text against node *names* already seen in the same extraction run —
-//! the same EXTRACTED-only boundary graphify itself draws, with no
-//! INFERRED/AMBIGUOUS tier and no LLM layer anywhere in this crate.
+//! tree-sitter-based structural extraction, multi-language (Rust, TS/TSX/JS, Go, Python) behind one `Language` dispatch.
+//! Deterministic AST facts only: no macro/generic expansion, no cross-file type resolution. `Calls`/`Implements` edges resolve by
+//! matching an identifier's short text against node names already seen in the same extraction run.
 
 mod go;
 mod javascript;
@@ -26,9 +14,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
-/// Directory names skipped everywhere, on top of any dot-directory
-/// (`.git`, `.venv`, ...) — build/dependency output for the four
-/// supported languages, never real source.
+/// Directory names skipped everywhere, on top of any dot-directory -- build/dependency output for the supported languages.
 const SKIP_DIRS: &[&str] = &[
     "target",
     "node_modules",
@@ -73,10 +59,7 @@ impl Language {
     }
 }
 
-/// Walk `root` for `*.rs`/`*.ts`/`*.tsx`/`*.js`/`*.jsx`/`*.go`/`*.py`
-/// files (skipping `target`/`node_modules`/`dist`/`build`/
-/// `__pycache__`/`vendor` and any dot-directory), parse each with the
-/// matching tree-sitter grammar, and extract a fresh `CodeGraph`.
+/// Walk `root` for supported source files, parse each with the matching tree-sitter grammar, and extract a fresh `CodeGraph`.
 pub fn extract_dir(root: &Path) -> std::io::Result<CodeGraph> {
     let mut graph = CodeGraph::new();
     let files = collect_source_files(root)?;
@@ -102,17 +85,9 @@ pub struct UpdateSummary {
     pub edge_count: usize,
 }
 
-/// Incremental counterpart to `extract_dir`: loads the graph and
-/// manifest already saved at `graph_path`/`manifest_path` (an empty
-/// graph/manifest if this is the first run for this bank), re-extracts
-/// only files whose content-hash changed or that are new, drops nodes
-/// for files deleted since the last run, and saves both back.
-///
-/// Known limitation, accepted for this MVP: a `Calls`/`Implements` edge
-/// from an *unchanged* file into a symbol that a changed file renamed
-/// is not re-resolved — only files actually re-extracted this run get
-/// their pending calls/impls re-resolved. A full `build` always
-/// recomputes correctly.
+/// Incremental counterpart to `extract_dir`: re-extracts only files whose content-hash changed or that are new, drops nodes for deleted
+/// files, and saves both graph and manifest back. Known limitation: an edge from an *unchanged* file into a symbol a changed file
+/// renamed isn't re-resolved -- only files re-extracted this run get their pending calls/impls resolved. A full `build` always recomputes.
 pub fn update_dir(
     root: &Path,
     graph_path: &Path,
@@ -181,11 +156,7 @@ pub fn update_dir(
     })
 }
 
-/// Hash every current supported-language file under `root`, independent
-/// of any existing graph or manifest — used after a full `extract_dir`
-/// (`trm graph build`) to (re)seed the manifest so a later `trm graph
-/// update` diffs against real content hashes instead of treating every
-/// file as new on its very first run.
+/// Hash every current supported-language file under `root`, used to (re)seed the manifest after a full `extract_dir` build.
 pub fn manifest_for(root: &Path) -> std::io::Result<Manifest> {
     let mut manifest = Manifest::default();
     for path in collect_source_files(root)? {
@@ -204,13 +175,8 @@ fn rel_of(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Parse each of `files` (relative to `root`) with the grammar matching
-/// its extension and fold its nodes/edges into `graph`, appending any
-/// not-yet-resolvable `Calls`/`Implements` targets to
-/// `pending_calls`/`pending_impls` for `resolve_pending` to settle
-/// afterward. Shared by both a full `extract_dir` run (every file) and
-/// `update_dir` (only changed/new files). One `Parser` per language is
-/// built lazily and reused across files of that language.
+/// Parse each of `files` with the grammar matching its extension and fold its nodes/edges into `graph`, queuing unresolvable
+/// `Calls`/`Implements` targets for `resolve_pending`. One `Parser` per language, built lazily and reused.
 fn extract_files(
     files: &[PathBuf],
     root: &Path,
@@ -230,8 +196,7 @@ fn extract_files(
         };
         let rel = rel_of(path, root);
         let Ok(source) = std::fs::read_to_string(path) else {
-            // Non-UTF-8 or unreadable file — skip rather than fail the
-            // whole extraction run over one file.
+            // Non-UTF-8 or unreadable -- skip rather than fail the whole run.
             continue;
         };
 
@@ -290,13 +255,8 @@ fn extract_files(
     }
 }
 
-/// Resolve every pending `Implements`/`Calls` target by short name
-/// against `graph`'s current nodes (which may include files this run
-/// didn't touch). `Implements` tries a `Trait`-kind match first (Rust
-/// `impl Trait for Type`, TS `implements`), then falls back to a
-/// `Struct`-kind match (class inheritance in TS/JS/Python, which this
-/// crate also files under `Implements` since there is no separate
-/// "Inherits" edge kind).
+/// Resolve every pending `Implements`/`Calls` target by short name against `graph`'s current nodes. `Implements` tries `Trait` first,
+/// then falls back to `Struct` (class inheritance in TS/JS/Python has no separate "Inherits" edge kind).
 fn resolve_pending(
     graph: &mut CodeGraph,
     pending_impls: Vec<(String, String)>,
