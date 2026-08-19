@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>total-recall · Architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1200px; width: 100%; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · Diagram Design</p>
+    <h1>total-recall (trm) · subsystem map</h1>
+
+    <svg viewBox="0 0 1000 484" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="architecture-title architecture-desc">
+      <title id="architecture-title">total-recall (trm) subsystem map</title>
+      <desc id="architecture-desc">Architecture diagram showing the trm CLI dispatching to Wiki, Graph, CCR, and Session Ingest subsystems, with Wiki and Graph both calling a local embedder, and all four subsystems persisting to a bank store on disk.</desc>
+      <defs>
+        <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+          <circle cx="1" cy="1" r="0.9" fill="rgba(45,49,66,0.10)"/>
+        </pattern>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+      <rect width="100%" height="100%" fill="url(#dots)" opacity="0.55"/>
+
+      <!-- Bus: CLI -> 4 subsystems -->
+      <path d="M 180,96 V 132" fill="none" stroke="#eb6c36" stroke-width="1.2" />
+      <path d="M 140,132 H 860" fill="none" stroke="#eb6c36" stroke-width="1.2" />
+      <path d="M 180,132 V 96" fill="none" stroke="#eb6c36" stroke-width="1.2" />
+      <path d="M 140,132 V 168" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+      <path d="M 380,132 V 168" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+      <path d="M 620,132 V 168" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+      <path d="M 860,132 V 168" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+
+      <!-- Wiki / Graph -> Embeddings (dashed, optional/sync call) -->
+      <path d="M 140,168 V 138 H 660 V 96" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <path d="M 380,168 V 150 H 740 V 96" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+      <!-- 4 subsystems -> Bank Store (straight verticals, shared x) -->
+      <line x1="140" y1="232" x2="140" y2="344" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+      <line x1="380" y1="232" x2="380" y2="344" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+      <line x1="620" y1="232" x2="620" y2="344" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+      <line x1="860" y1="232" x2="860" y2="344" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+
+      <!-- Arrow labels -->
+      <rect x="152" y="126" width="44" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="174" y="136" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">DISPATCH</text>
+
+      <rect x="632" y="118" width="56" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="660" y="128" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NAME MATCH</text>
+
+      <rect x="800" y="304" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="820" y="314" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SAVE</text>
+
+      <!-- CLI (focal) -->
+      <rect x="100" y="40" width="160" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="100" y="40" width="160" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="108" y="48" width="28" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="122" y="57" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLI</text>
+      <text x="180" y="72" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">trm CLI</text>
+      <text x="180" y="86" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">main.rs · clap</text>
+
+      <!-- Embeddings (focal) -->
+      <rect x="580" y="40" width="240" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="580" y="40" width="240" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="588" y="48" width="36" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="606" y="57" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">LOCAL</text>
+      <text x="700" y="72" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Embeddings</text>
+      <text x="700" y="86" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">candle · all-MiniLM-L6-v2 · no API</text>
+
+      <!-- Wiki -->
+      <rect x="60" y="168" width="160" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="60" y="168" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="68" y="176" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="82" y="185" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SYS</text>
+      <text x="140" y="204" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Wiki</text>
+      <text x="140" y="220" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">wiki.rs · semantic memory</text>
+
+      <!-- Graph -->
+      <rect x="300" y="168" width="160" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="300" y="168" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="308" y="176" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="322" y="185" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SYS</text>
+      <text x="380" y="204" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Graph</text>
+      <text x="380" y="220" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">graph/ · AST code graph</text>
+
+      <!-- CCR -->
+      <rect x="540" y="168" width="160" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="540" y="168" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="548" y="176" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="562" y="185" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SYS</text>
+      <text x="620" y="204" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CCR</text>
+      <text x="620" y="220" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ccr.rs · recovery store</text>
+
+      <!-- Session Ingest -->
+      <rect x="780" y="168" width="160" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="780" y="168" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="788" y="176" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="802" y="185" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SYS</text>
+      <text x="860" y="204" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Session Ingest</text>
+      <text x="860" y="220" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ingest.rs · checkpoint.rs</text>
+
+      <!-- Bank Store -->
+      <rect x="60" y="344" width="880" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="60" y="344" width="880" height="64" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <rect x="68" y="352" width="36" height="12" rx="2" fill="transparent" stroke="rgba(79,93,117,0.50)" stroke-width="0.8"/>
+      <text x="86" y="361" fill="#4f5d75" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STORE</text>
+      <text x="500" y="380" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Bank Store</text>
+      <text x="500" y="396" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">~/.trm/banks/&lt;bank&gt;/ — plain files, no daemon</text>
+
+      <!-- Legend -->
+      <line x1="60" y1="424" x2="940" y2="424" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="60" y="440" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <rect x="60" y="452" width="14" height="10" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <text x="80" y="460" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Focal / entry &amp; local model</text>
+
+      <rect x="260" y="452" width="14" height="10" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="280" y="460" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Subsystem</text>
+
+      <rect x="400" y="452" width="14" height="10" rx="2" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="420" y="460" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Store</text>
+
+      <line x1="540" y1="457" x2="568" y2="457" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <text x="576" y="460" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Sync call, no persistence</text>
+    </svg>
+  </div>
+</body>
+</html>
