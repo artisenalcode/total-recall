@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.bump.outputs.should_release }}
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: bump
+        run: |
+          set -euo pipefail
+
+          last_tag=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+          if [ -z "$last_tag" ]; then
+            range=""
+          else
+            range="${last_tag}..HEAD"
+          fi
+          commits=$(git log $range --pretty=format:'%s%n%b')
+
+          # Conventional-commits bump: any "type!:" or "BREAKING CHANGE:"
+          # since the last tag wins major; else any "feat:" wins minor;
+          # else any "fix:" wins patch; else no release.
+          bump=none
+          if echo "$commits" | grep -Eq '^[a-z]+(\([^)]*\))?!:|BREAKING CHANGE:'; then
+            bump=major
+          elif echo "$commits" | grep -Eq '^feat(\([^)]*\))?:'; then
+            bump=minor
+          elif echo "$commits" | grep -Eq '^fix(\([^)]*\))?:'; then
+            bump=patch
+          fi
+
+          if [ "$bump" = none ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          current=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          IFS='.' read -r major minor patch <<< "$current"
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new_version="${major}.${minor}.${patch}"
+          new_tag="v${new_version}"
+
+          sed -i "0,/^version = \"${current}\"/s//version = \"${new_version}\"/" Cargo.toml
+          CURRENT="$current" NEW_VERSION="$new_version" python3 - <<'PY'
+          import os, re
+          current = os.environ["CURRENT"]
+          new_version = os.environ["NEW_VERSION"]
+          with open("Cargo.lock") as f:
+              text = f.read()
+          pattern = re.compile(
+              r'(name = "total-recall"\nversion = ")' + re.escape(current) + r'(")'
+          )
+          text, n = pattern.subn(rf'\g<1>{new_version}\g<2>', text, count=1)
+          assert n == 1, "did not find total-recall's own Cargo.lock entry"
+          with open("Cargo.lock", "w") as f:
+              f.write(text)
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): ${new_tag} [skip ci]"
+          git tag "$new_tag"
+          git push origin HEAD:main
+          git push origin "$new_tag"
+
+          echo "version=${new_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${new_tag}" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: bump-version
+    if: needs.bump-version.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive_ext: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive_ext: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: matrix.archive_ext == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "../../../trm-${{ needs.bump-version.outputs.version }}-${{ matrix.target }}.tar.gz" trm
+      - name: Package (windows)
+        if: matrix.archive_ext == 'zip'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a "../../../trm-${{ needs.bump-version.outputs.version }}-${{ matrix.target }}.zip" trm.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: trm-${{ matrix.target }}
+          path: trm-${{ needs.bump-version.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+
+  release:
+    needs: [bump-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.bump-version.outputs.tag }}
+          files: dist/*
