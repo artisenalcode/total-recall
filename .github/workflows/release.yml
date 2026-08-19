@@ -38,11 +38,11 @@ jobs:
           # since the last tag wins major; else any "feat:" wins minor;
           # else any "fix:" wins patch; else no release.
           bump=none
-          if echo "$commits" | grep -Eq '^[a-z]+(\([^)]*\))?!:|BREAKING CHANGE:'; then
+          if grep -Eq '^[a-z]+(\([^)]*\))?!:|BREAKING CHANGE:' <<< "$commits"; then
             bump=major
-          elif echo "$commits" | grep -Eq '^feat(\([^)]*\))?:'; then
+          elif grep -Eq '^feat(\([^)]*\))?:' <<< "$commits"; then
             bump=minor
-          elif echo "$commits" | grep -Eq '^fix(\([^)]*\))?:'; then
+          elif grep -Eq '^fix(\([^)]*\))?:' <<< "$commits"; then
             bump=patch
           fi
 
