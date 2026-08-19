@@ -9,7 +9,9 @@
 //! tiers (this crate only ever produces the EXTRACTED equivalent — no LLM
 //! layer exists here at all, by design).
 
+use crate::graph::manifest::Manifest;
 use crate::graph::model::{CodeGraph, EdgeKind, Node, NodeKind};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node as TsNode, Parser};
 
@@ -24,26 +26,152 @@ use tree_sitter::{Node as TsNode, Parser};
 pub fn extract_dir(root: &Path) -> std::io::Result<CodeGraph> {
     let mut graph = CodeGraph::new();
     let files = collect_rust_files(root)?;
-
-    // Resolved in a second pass, once every file in this run has
-    // contributed its nodes — a call or an impl's trait can reference a
-    // node this loop hasn't reached yet (a different file, or one later
-    // in file order).
     let mut pending_calls: Vec<(String, String)> = Vec::new();
     let mut pending_impls: Vec<(String, String)> = Vec::new();
+    extract_files(
+        &files,
+        root,
+        &mut graph,
+        &mut pending_calls,
+        &mut pending_impls,
+    );
+    resolve_pending(&mut graph, pending_impls, pending_calls);
+    Ok(graph)
+}
 
+/// Summary of one `update_dir` run, for the CLI to report.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpdateSummary {
+    pub files_changed: usize,
+    pub files_deleted: usize,
+    pub node_count: usize,
+    pub edge_count: usize,
+}
+
+/// Incremental counterpart to `extract_dir`: loads the graph and
+/// manifest already saved at `graph_path`/`manifest_path` (an empty
+/// graph/manifest if this is the first run for this bank — the same
+/// "missing file is not an error" convention `CodeGraph::load` and
+/// `Manifest::load` already follow), re-extracts only files whose
+/// content-hash changed or that are new, drops nodes for files deleted
+/// since the last run, and saves both back.
+///
+/// Known limitation, accepted for this MVP (see the plan doc's Risks
+/// section): a `Calls`/`Implements` edge from an *unchanged* file into a
+/// symbol that a changed file renamed is not re-resolved to the new
+/// name — only files actually re-extracted this run get their pending
+/// calls/impls re-resolved. A full `build` always recomputes correctly.
+pub fn update_dir(
+    root: &Path,
+    graph_path: &Path,
+    manifest_path: &Path,
+) -> std::io::Result<UpdateSummary> {
+    let mut graph = CodeGraph::load(graph_path)?;
+    let mut manifest = Manifest::load(manifest_path);
+
+    let files = collect_rust_files(root)?;
+    let mut current_rels: HashSet<String> = HashSet::new();
+    let mut to_extract: Vec<PathBuf> = Vec::new();
+    let mut changed_rels: HashSet<String> = HashSet::new();
+
+    for path in &files {
+        let rel = rel_of(path, root);
+        current_rels.insert(rel.clone());
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let hash = crate::embed_cache::content_hash(&source);
+        if manifest.get(&rel) != Some(hash) {
+            changed_rels.insert(rel);
+            to_extract.push(path.clone());
+        }
+    }
+
+    let deleted_rels: HashSet<String> = manifest
+        .paths()
+        .filter(|rel| !current_rels.contains(rel.as_str()))
+        .cloned()
+        .collect();
+
+    let mut to_remove = changed_rels.clone();
+    to_remove.extend(deleted_rels.iter().cloned());
+    graph.remove_files(&to_remove);
+
+    let mut pending_calls: Vec<(String, String)> = Vec::new();
+    let mut pending_impls: Vec<(String, String)> = Vec::new();
+    extract_files(
+        &to_extract,
+        root,
+        &mut graph,
+        &mut pending_calls,
+        &mut pending_impls,
+    );
+    resolve_pending(&mut graph, pending_impls, pending_calls);
+
+    for rel in &deleted_rels {
+        manifest.remove(rel);
+    }
+    for path in &to_extract {
+        let rel = rel_of(path, root);
+        if let Ok(source) = std::fs::read_to_string(path) {
+            manifest.set(rel, crate::embed_cache::content_hash(&source));
+        }
+    }
+
+    graph.save(graph_path)?;
+    manifest.save(manifest_path)?;
+
+    Ok(UpdateSummary {
+        files_changed: changed_rels.len(),
+        files_deleted: deleted_rels.len(),
+        node_count: graph.node_count(),
+        edge_count: graph.edge_count(),
+    })
+}
+
+/// Hash every current `*.rs` file under `root`, independent of any
+/// existing graph or manifest — used after a full `extract_dir` (`trm
+/// graph build`) to (re)seed the manifest so a later `trm graph update`
+/// diffs against real content hashes instead of treating every file as
+/// new on its very first run.
+pub fn manifest_for(root: &Path) -> std::io::Result<Manifest> {
+    let mut manifest = Manifest::default();
+    for path in collect_rust_files(root)? {
+        let rel = rel_of(&path, root);
+        if let Ok(source) = std::fs::read_to_string(&path) {
+            manifest.set(rel, crate::embed_cache::content_hash(&source));
+        }
+    }
+    Ok(manifest)
+}
+
+fn rel_of(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Parse each of `files` (relative to `root`) and fold its nodes/edges
+/// into `graph`, appending any not-yet-resolvable `Calls`/`Implements`
+/// targets to `pending_calls`/`pending_impls` for `resolve_pending` to
+/// settle afterward. Shared by both a full `extract_dir` run (every file)
+/// and `update_dir` (only changed/new files).
+fn extract_files(
+    files: &[PathBuf],
+    root: &Path,
+    graph: &mut CodeGraph,
+    pending_calls: &mut Vec<(String, String)>,
+    pending_impls: &mut Vec<(String, String)>,
+) {
     let language = tree_sitter_rust::LANGUAGE.into();
     let mut parser = Parser::new();
     parser
         .set_language(&language)
         .expect("tree-sitter-rust grammar failed to load");
 
-    for path in &files {
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+    for path in files {
+        let rel = rel_of(path, root);
         let Ok(source) = std::fs::read_to_string(path) else {
             // Non-UTF-8 or unreadable file — skip rather than fail the
             // whole extraction run over one file.
@@ -67,12 +195,23 @@ pub fn extract_dir(root: &Path) -> std::io::Result<CodeGraph> {
             &source,
             &rel,
             None,
-            &mut graph,
-            &mut pending_calls,
-            &mut pending_impls,
+            graph,
+            pending_calls,
+            pending_impls,
         );
     }
+}
 
+/// Resolve every pending `Implements`/`Calls` target by short name
+/// against `graph`'s current nodes (which may include files this run
+/// didn't touch) — the second pass `extract_dir`'s own doc comment
+/// describes, factored out so `update_dir` can run the same resolution
+/// after a partial `extract_files` pass.
+fn resolve_pending(
+    graph: &mut CodeGraph,
+    pending_impls: Vec<(String, String)>,
+    pending_calls: Vec<(String, String)>,
+) {
     for (type_id, trait_name) in pending_impls {
         if let Some(trait_id) = graph.find_by_name(NodeKind::Trait, &trait_name) {
             graph.add_edge(&type_id, &trait_id, EdgeKind::Implements);
@@ -83,8 +222,6 @@ pub fn extract_dir(root: &Path) -> std::io::Result<CodeGraph> {
             graph.add_edge(&caller_id, &callee_id, EdgeKind::Calls);
         }
     }
-
-    Ok(graph)
 }
 
 fn text(node: &TsNode, source: &str) -> String {
@@ -362,5 +499,95 @@ mod tests {
                 .find_by_name(NodeKind::Function, "also_ignored")
                 .is_none()
         );
+    }
+
+    fn graph_and_manifest_paths(tmp: &Path) -> (PathBuf, PathBuf) {
+        (tmp.join("graph.json"), tmp.join("manifest.json"))
+    }
+
+    #[test]
+    fn update_dir_on_a_bank_with_no_prior_graph_behaves_like_a_first_build() {
+        let src = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write_fixture(src.path(), "src/lib.rs", "fn real() {}");
+        let (graph_path, manifest_path) = graph_and_manifest_paths(store.path());
+
+        let summary = update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+        assert_eq!(summary.files_changed, 1);
+        assert_eq!(summary.files_deleted, 0);
+
+        let graph = CodeGraph::load(&graph_path).unwrap();
+        assert!(graph.node_index("src/lib.rs::real").is_some());
+    }
+
+    #[test]
+    fn update_dir_picks_up_a_newly_added_file_without_rescanning_unchanged_ones() {
+        let src = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write_fixture(src.path(), "src/lib.rs", "fn one() {}");
+        let (graph_path, manifest_path) = graph_and_manifest_paths(store.path());
+        update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+
+        write_fixture(src.path(), "src/extra.rs", "fn two() {}");
+        let summary = update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+
+        assert_eq!(summary.files_changed, 1, "only the new file re-extracted");
+        let graph = CodeGraph::load(&graph_path).unwrap();
+        assert!(graph.node_index("src/lib.rs::one").is_some());
+        assert!(graph.node_index("src/extra.rs::two").is_some());
+    }
+
+    #[test]
+    fn update_dir_re_extracts_a_changed_files_new_content_and_drops_its_stale_nodes() {
+        let src = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write_fixture(src.path(), "src/lib.rs", "fn old_name() {}");
+        let (graph_path, manifest_path) = graph_and_manifest_paths(store.path());
+        update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+
+        write_fixture(src.path(), "src/lib.rs", "fn new_name() {}");
+        let summary = update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+
+        assert_eq!(summary.files_changed, 1);
+        let graph = CodeGraph::load(&graph_path).unwrap();
+        assert!(graph.node_index("src/lib.rs::new_name").is_some());
+        assert!(
+            graph.node_index("src/lib.rs::old_name").is_none(),
+            "stale node for the removed function should be gone"
+        );
+    }
+
+    #[test]
+    fn update_dir_drops_nodes_for_a_deleted_file() {
+        let src = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write_fixture(src.path(), "src/lib.rs", "fn stays() {}");
+        write_fixture(src.path(), "src/gone.rs", "fn vanishes() {}");
+        let (graph_path, manifest_path) = graph_and_manifest_paths(store.path());
+        update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+
+        std::fs::remove_file(src.path().join("src/gone.rs")).unwrap();
+        let summary = update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+
+        assert_eq!(summary.files_deleted, 1);
+        assert_eq!(summary.files_changed, 0);
+        let graph = CodeGraph::load(&graph_path).unwrap();
+        assert!(graph.node_index("src/lib.rs::stays").is_some());
+        assert!(graph.node_index("src/gone.rs").is_none());
+        assert!(graph.node_index("src/gone.rs::vanishes").is_none());
+    }
+
+    #[test]
+    fn update_dir_with_no_changes_is_a_no_op() {
+        let src = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write_fixture(src.path(), "src/lib.rs", "fn stable() {}");
+        let (graph_path, manifest_path) = graph_and_manifest_paths(store.path());
+        update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+
+        let summary = update_dir(src.path(), &graph_path, &manifest_path).unwrap();
+        assert_eq!(summary.files_changed, 0);
+        assert_eq!(summary.files_deleted, 0);
+        assert_eq!(summary.node_count, 2); // File node + one Function node
     }
 }

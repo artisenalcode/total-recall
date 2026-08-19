@@ -283,6 +283,19 @@ enum GraphAction {
     /// Extract a fresh graph from `path` and save it to the resolved
     /// bank's `graph` tier, replacing any graph already there.
     Build { path: PathBuf },
+    /// Re-extract only files under `path` whose content changed since the
+    /// last `build`/`update`, and drop nodes for files deleted since
+    /// then — cheaper than `build` on an unchanged-mostly tree. Errors if
+    /// no graph exists yet for this bank (run `build` first).
+    Update { path: PathBuf },
+    /// Rank the `limit` nodes whose name is the closest cosine-similarity
+    /// match to `query`, using the same local embedder `trm recall` uses
+    /// — no LLM/API call, name-text matching only.
+    Query {
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
     /// Print the top `n` nodes by total degree (in + out edges) — the
     /// nodes with the most fan-in/fan-out, a cheap refactor-risk signal.
     GodNodes {
@@ -544,6 +557,28 @@ clinical-psychology advisor in this store) for the sub-agent completing
 the job. Mechanical only — trm never calls an LLM itself, per ADR-0002;
 synthesis happens when a sub-agent reads the pending prompt and writes
 the actual wiki page via `trm complete-handover`.
+
+## Code graph (Rust only, for now)
+
+    trm graph build <path>              # full extraction, replaces any existing graph
+    trm graph update <path>             # re-extract only changed/new files, drop deleted ones
+    trm graph query "<question>"        # rank nodes by name-embedding similarity to <question>
+    trm graph god-nodes [--n <count>]    # top nodes by total in+out degree
+    trm graph path <from> <to>          # shortest directed path between two node ids
+
+AST-derived, no LLM/API call anywhere in this path (see
+docs/ideation/trm-code-graph/2026-08-19-scoped-graph-mvp-plan.md) —
+`build`/`update` parse `*.rs` files with tree-sitter and emit
+deterministic File/Function/Struct/Enum/Trait/Impl nodes and
+Contains/Calls/Implements edges; `query` reuses the same local embedder
+`recall` uses to match a question's text against node *names*, not
+node bodies. Saved per bank at `~/.trm/banks/<bank-id>/graph/graph.json`
+(plus a `manifest.json` content-hash manifest `update` uses to skip
+unchanged files). `update` on a bank with no prior graph behaves like a
+first `build`. `Calls`/`Implements` edges are resolved by short-name
+matching, not real type inference — an accepted MVP imprecision, not a
+bug, same as graphify's own EXTRACTED/INFERRED boundary but with no
+LLM-backed INFERRED tier at all here.
 
 ## Where facts live
 
@@ -1001,28 +1036,99 @@ fn main() -> ExitCode {
             let bank_id = bank::resolve_bank_id(cli.bank.as_deref(), &cwd);
             let paths = bank::paths_for(&data_root, &bank_id);
             let graph_path = graph::graph_file_path(&paths);
+            let manifest_path = graph::manifest_file_path(&paths);
             match action {
                 GraphAction::Build { path } => match graph::extract::extract_dir(&path) {
-                    Ok(g) => match g.save(&graph_path) {
-                        Ok(()) => {
-                            println!(
-                                "trm graph build: {} nodes, {} edges -> {}",
-                                g.node_count(),
-                                g.edge_count(),
-                                graph_path.display()
-                            );
-                            ExitCode::SUCCESS
+                    Ok(g) => {
+                        // Also (re)write the manifest from this fresh extraction
+                        // so a later `trm graph update` diffs against real
+                        // content hashes instead of treating every file as new.
+                        let manifest = graph::extract::manifest_for(&path)
+                            .unwrap_or_else(|_| graph::manifest::Manifest::default());
+                        match g
+                            .save(&graph_path)
+                            .and_then(|()| manifest.save(&manifest_path))
+                        {
+                            Ok(()) => {
+                                println!(
+                                    "trm graph build: {} nodes, {} edges -> {}",
+                                    g.node_count(),
+                                    g.edge_count(),
+                                    graph_path.display()
+                                );
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => {
+                                eprintln!("trm graph build: failed to save graph: {e}");
+                                ExitCode::FAILURE
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("trm graph build: failed to save graph: {e}");
-                            ExitCode::FAILURE
-                        }
-                    },
+                    }
                     Err(e) => {
                         eprintln!("trm graph build: extraction failed: {e}");
                         ExitCode::FAILURE
                     }
                 },
+                GraphAction::Update { path } => {
+                    match graph::extract::update_dir(&path, &graph_path, &manifest_path) {
+                        Ok(summary) => {
+                            println!(
+                                "trm graph update: {} changed, {} deleted, {} nodes, {} edges -> {}",
+                                summary.files_changed,
+                                summary.files_deleted,
+                                summary.node_count,
+                                summary.edge_count,
+                                graph_path.display()
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("trm graph update: failed: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                GraphAction::Query { query, limit } => {
+                    match graph::model::CodeGraph::load(&graph_path) {
+                        Ok(g) => {
+                            if g.node_count() == 0 {
+                                eprintln!(
+                                    "trm graph query: no graph yet for this bank -- run `trm graph build <path>` first"
+                                );
+                                return ExitCode::FAILURE;
+                            }
+                            match embeddings::Embedder::new(bank::data_root().join("models")) {
+                                Ok(mut embedder) => {
+                                    match graph::query::semantic_query(
+                                        &g,
+                                        &query,
+                                        &mut embedder,
+                                        limit,
+                                    ) {
+                                        Ok(results) => {
+                                            for (id, score) in results {
+                                                println!("{score:.3}\t{id}");
+                                            }
+                                            ExitCode::SUCCESS
+                                        }
+                                        Err(e) => {
+                                            eprintln!("trm graph query: {e}");
+                                            ExitCode::FAILURE
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("trm graph query: failed to load embedder: {e}");
+                                    ExitCode::FAILURE
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("trm graph query: failed to load graph: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
                 GraphAction::GodNodes { n } => match graph::model::CodeGraph::load(&graph_path) {
                     Ok(g) => {
                         if g.node_count() == 0 {
@@ -1671,6 +1777,16 @@ mod tests {
         assert!(CORE_DOCS.contains("standalone `persona` repo"));
         assert!(CORE_DOCS.contains("trm stage-persona"));
         assert!(CORE_DOCS.contains("PersonaBuild"));
+    }
+
+    #[test]
+    fn core_docs_covers_code_graph() {
+        assert!(CORE_DOCS.contains("trm graph build"));
+        assert!(CORE_DOCS.contains("trm graph update"));
+        assert!(CORE_DOCS.contains("trm graph query"));
+        assert!(CORE_DOCS.contains("trm graph god-nodes"));
+        assert!(CORE_DOCS.contains("trm graph path"));
+        assert!(CORE_DOCS.contains("no LLM/API call"));
     }
 
     #[test]

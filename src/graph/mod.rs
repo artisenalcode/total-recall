@@ -6,7 +6,9 @@
 //! doc's remaining Steps.
 
 pub mod extract;
+pub mod manifest;
 pub mod model;
+pub mod query;
 
 use crate::bank::BankPaths;
 use std::path::PathBuf;
@@ -15,6 +17,12 @@ use std::path::PathBuf;
 /// (parallel to `wiki`/`raw`/`sessions`), this is the one file in it.
 pub fn graph_file_path(paths: &BankPaths) -> PathBuf {
     paths.graph.join("graph.json")
+}
+
+/// Where a bank's incremental-`update` content-hash manifest lives —
+/// alongside `graph.json` in the same tier, see `graph::manifest`.
+pub fn manifest_file_path(paths: &BankPaths) -> PathBuf {
+    paths.graph.join("manifest.json")
 }
 
 /// Rank nodes by total degree (in + out), highest first — graphify's own

@@ -117,6 +117,52 @@ impl CodeGraph {
         }
     }
 
+    /// Remove every node belonging to any of `rels` (a file's own `File`
+    /// node, plus every item node whose id is scoped under it —
+    /// `"{rel}::..."`) along with every edge touching them. Used by
+    /// incremental `update` to drop a changed or deleted file's stale
+    /// nodes before re-extracting it (or, for a deletion, before simply
+    /// leaving it out).
+    ///
+    /// Rebuilds the graph from scratch rather than calling `petgraph`'s
+    /// own `remove_node` in a loop — `remove_node` uses swap-remove
+    /// semantics that silently invalidate other nodes' `NodeIndex`
+    /// values, which would desync `self.index`. A full rebuild is O(n)
+    /// either way and this crate's graphs are one-codebase-sized, not
+    /// worth the bookkeeping to avoid.
+    pub fn remove_files(&mut self, rels: &std::collections::HashSet<String>) {
+        let belongs_to_removed = |id: &str| {
+            rels.iter()
+                .any(|r| id == r.as_str() || id.starts_with(&format!("{r}::")))
+        };
+
+        let mut new_graph = DiGraph::new();
+        let mut new_index = HashMap::new();
+        for node in self.graph.node_weights() {
+            if !belongs_to_removed(&node.id) {
+                let id = node.id.clone();
+                let idx = new_graph.add_node(node.clone());
+                new_index.insert(id, idx);
+            }
+        }
+        for e in self.graph.edge_indices() {
+            let Some((from, to)) = self.graph.edge_endpoints(e) else {
+                continue;
+            };
+            let (Some(&f), Some(&t)) = (
+                new_index.get(&self.graph[from].id),
+                new_index.get(&self.graph[to].id),
+            ) else {
+                continue;
+            };
+            if let Some(&kind) = self.graph.edge_weight(e) {
+                new_graph.add_edge(f, t, kind);
+            }
+        }
+        self.graph = new_graph;
+        self.index = new_index;
+    }
+
     pub fn node_count(&self) -> usize {
         self.graph.node_count()
     }
@@ -254,6 +300,70 @@ mod tests {
         let idx = loaded.node_index("src/foo.rs::Foo::new").unwrap();
         assert_eq!(loaded.graph[idx].kind, NodeKind::Function);
         assert_eq!(loaded.graph[idx].name, "new");
+    }
+
+    #[test]
+    fn remove_files_drops_the_file_node_and_every_scoped_item_node() {
+        let mut g = sample_graph();
+        let mut rels = std::collections::HashSet::new();
+        rels.insert("src/foo.rs".to_string());
+        g.remove_files(&rels);
+        assert_eq!(g.node_count(), 0);
+        assert_eq!(g.edge_count(), 0);
+        assert!(g.node_index("src/foo.rs").is_none());
+        assert!(g.node_index("src/foo.rs::Foo").is_none());
+    }
+
+    #[test]
+    fn remove_files_leaves_other_files_nodes_and_edges_untouched() {
+        let mut g = sample_graph();
+        g.upsert_node(Node {
+            id: "src/bar.rs".to_string(),
+            kind: NodeKind::File,
+            name: "bar.rs".to_string(),
+        });
+        g.upsert_node(Node {
+            id: "src/bar.rs::Bar".to_string(),
+            kind: NodeKind::Struct,
+            name: "Bar".to_string(),
+        });
+        g.add_edge("src/bar.rs", "src/bar.rs::Bar", EdgeKind::Contains);
+
+        let mut rels = std::collections::HashSet::new();
+        rels.insert("src/foo.rs".to_string());
+        g.remove_files(&rels);
+
+        assert_eq!(g.node_count(), 2);
+        assert_eq!(g.edge_count(), 1);
+        assert!(g.node_index("src/bar.rs::Bar").is_some());
+    }
+
+    #[test]
+    fn remove_files_also_drops_an_edge_from_an_untouched_file_into_a_removed_one() {
+        let mut g = sample_graph();
+        g.upsert_node(Node {
+            id: "src/bar.rs".to_string(),
+            kind: NodeKind::File,
+            name: "bar.rs".to_string(),
+        });
+        g.upsert_node(Node {
+            id: "src/bar.rs::call_it".to_string(),
+            kind: NodeKind::Function,
+            name: "call_it".to_string(),
+        });
+        g.add_edge(
+            "src/bar.rs::call_it",
+            "src/foo.rs::Foo::new",
+            EdgeKind::Calls,
+        );
+
+        let mut rels = std::collections::HashSet::new();
+        rels.insert("src/foo.rs".to_string());
+        g.remove_files(&rels);
+
+        assert!(g.node_index("src/bar.rs::call_it").is_some());
+        assert!(g.node_index("src/foo.rs::Foo::new").is_none());
+        assert_eq!(g.edge_count(), 0);
     }
 
     #[test]
