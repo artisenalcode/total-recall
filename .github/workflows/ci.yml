@@ -16,13 +16,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Cache embedding model
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.trm/models
           key: ${{ runner.os }}-total-recall-embedding-model-v2
@@ -35,7 +35,7 @@ jobs:
       # just without this one test's real coverage.
       - name: Checkout squishi
         if: ${{ env.SQUISHI_CHECKOUT_PAT != '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: artisenalcode/squishi
           token: ${{ secrets.SQUISHI_CHECKOUT_PAT }}
@@ -53,7 +53,7 @@ jobs:
       - name: Cache squishi build
         if: ${{ env.SQUISHI_CHECKOUT_PAT != '' }}
         id: squishi-bin-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/squishi
           key: ${{ runner.os }}-squishi-bin-${{ steps.squishi-sha.outputs.sha }}
