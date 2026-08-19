@@ -57,6 +57,11 @@ jobs:
         with:
           path: ~/.cargo/bin/squishi
           key: ${{ runner.os }}-squishi-bin-${{ steps.squishi-sha.outputs.sha }}
+      # squishi depends on candle-onnx, whose build script shells out to
+      # `protoc` -- not present on the stock ubuntu-latest runner image.
+      - name: Install protoc
+        if: ${{ env.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build and install squishi
         if: ${{ env.SQUISHI_CHECKOUT_PAT != '' && steps.squishi-bin-cache.outputs.cache-hit != 'true' }}
         # --force: a squishi-bin-cache MISS (this step's own gate) doesn't
